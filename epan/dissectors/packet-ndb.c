@@ -391,6 +391,7 @@ static int hf_ndb_flag_simple;
 static int hf_ndb_flag_execute;
 static int hf_ndb_flag_start;
 static int hf_ndb_flag_abort;
+static int hf_ndb_flag_committed_base;
 static int hf_ndb_flag_no_wait;
 static int hf_ndb_flag_batch_safe;
 static int hf_ndb_flag_batch_unsafe;
@@ -426,6 +427,7 @@ static int hf_ndb_single_user;
 static int hf_ndb_single_user_api;
 static int hf_ndb_connected_node;
 static int hf_ndb_instance;
+static int hf_ndb_release_id;
 static int hf_ndb_caller_data;
 static int hf_ndb_request_type;
 static int hf_ndb_id_or_name_len;
@@ -581,6 +583,7 @@ static int * const ndb_flags_fields[] = {
     &hf_ndb_flag_execute,
     &hf_ndb_flag_start,
     &hf_ndb_flag_abort,
+    &hf_ndb_flag_committed_base,
     &hf_ndb_flag_no_wait,
     &hf_ndb_flag_batch_safe,
     &hf_ndb_flag_batch_unsafe,
@@ -1186,6 +1189,7 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
         ndb_word(w, hf_ndb_client_ptr);
         ndb_bits(w, hf_ndb_block_ref, ett_ndb_ref, ndb_ref_fields);
         ndb_word(w, hf_ndb_instance);
+        ndb_word(w, hf_ndb_release_id);
         break;
     case NDB_SIG_COORD_ALLOC_CONF:
         ndb_word(w, hf_ndb_client_ptr);
@@ -1201,6 +1205,7 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
         ndb_word(w, hf_ndb_coord_ptr);
         ndb_bits(w, hf_ndb_block_ref, ett_ndb_ref, ndb_ref_fields);
         ndb_word(w, hf_ndb_client_ptr);
+        ndb_word(w, hf_ndb_release_id);
         break;
     case NDB_SIG_COORD_FREE_CONF:
         ndb_word(w, hf_ndb_client_ptr);
@@ -2158,6 +2163,11 @@ proto_register_ndb(void)
         { &hf_ndb_flag_abort,
           { "On error", "ndb.flags.abort", FT_UINT32, BASE_DEC,
             VALS(ndb_abort_vals), 3U << 12, NULL, HFILL } },
+        { &hf_ndb_flag_committed_base,
+          { "Read committed base", "ndb.flags.committed_base", FT_BOOLEAN,
+            32, NULL, 1U << 20,
+            "A committed read through a unique index; a backup replica may "
+            "serve it", HFILL } },
         { &hf_ndb_flag_no_wait,
           { "No wait", "ndb.flags.no_wait", FT_BOOLEAN, 32, NULL, 1U << 21,
             NULL, HFILL } },
@@ -2266,6 +2276,10 @@ proto_register_ndb(void)
         { &hf_ndb_instance,
           { "Instance", "ndb.instance", FT_UINT32, BASE_DEC, NULL, 0x0, NULL,
             HFILL } },
+        { &hf_ndb_release_id,
+          { "Release id", "ndb.release_id", FT_UINT32, BASE_HEX, NULL, 0x0,
+            "Picked at random when the record is allocated; only a free "
+            "with the same id frees it", HFILL } },
         { &hf_ndb_caller_data,
           { "Caller's data", "ndb.caller_data", FT_UINT32, BASE_HEX, NULL,
             0x0, NULL, HFILL } },
