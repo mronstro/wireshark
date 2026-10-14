@@ -58,8 +58,16 @@
  * same signal: a header word per part (the block it is for in bits
  * 16-31, its length less three in bits 0-4), then its data.
  *
- * A signal too long for one message travels in fragments. They are shown
- * one by one with their fragment id; they are not put together yet.
+ * A signal too long for one message travels as a train of fragments,
+ * marked first, middle and last, on one link. Each fragment's data ends
+ * with the number of each section it carries and the train's fragment
+ * id; its sections are pieces of the signal's, appended to the section
+ * their number names. The data nodes repeat the signal's data in every
+ * fragment and send the highest section first; an API node puts the
+ * data in the last fragment only and the sections in order. Either way
+ * the last fragment's data is the signal's. The dissector shows each
+ * fragment, and at the last one the joined signal, as a data source of
+ * its own, with the frames its fragments came in.
  */
 
 #include "config.h"
@@ -70,6 +78,7 @@
 #include <epan/proto_data.h>
 #include <epan/tfs.h>
 #include <wsutil/array.h>
+#include <wsutil/pint.h>
 
 void proto_register_ndb(void);
 void proto_reg_handoff_ndb(void);
@@ -132,8 +141,18 @@ static dissector_handle_t ndb_handle;
 #define NDB_LIST_OBJECTS_CONF_WORDS 2
 #define NDB_OBJECT_WORDS          3
 
-/* Keys for per-packet data. */
+/* Keys for per-packet data: the calls for a frame, and from this key up
+ * one per message, by call (bits 18-29) and message (bits 0-17). */
 #define NDB_KEY_CALLS             0x7fffffff
+#define NDB_KEY_MESSAGES          0x40000000
+#define NDB_KEY_CALL_SHIFT        18
+#define NDB_KEY_MESSAGE_MASK      0x0003ffff
+
+/* Fragment states. */
+#define NDB_FRAGMENT_FIRST        1
+#define NDB_FRAGMENT_LAST         3
+/* The most words a joined signal is shown with: its length field. */
+#define NDB_MAX_JOINED_WORDS      0xffffU
 
 /* Signal numbers, by iClaustron's names. */
 #define NDB_SIG_HEARTBEAT_CONF          1
@@ -369,6 +388,9 @@ static int hf_ndb_section;
 static int hf_ndb_checksum;
 static int hf_ndb_fragment_id;
 static int hf_ndb_section_number;
+static int hf_ndb_joined_in;
+static int hf_ndb_train_fragments;
+static int hf_ndb_train_frame;
 /* Bundles */
 static int hf_ndb_part_header;
 static int hf_ndb_part_receiver;
@@ -435,6 +457,7 @@ static int hf_ndb_schema_trans;
 static int hf_ndb_total_len;
 static int hf_ndb_table_kind;
 static int hf_ndb_row;
+static int hf_ndb_row_len;
 static int hf_ndb_error_line;
 static int hf_ndb_list_flags;
 static int hf_ndb_list_names;
@@ -538,6 +561,7 @@ static int ett_ndb_object_flags;
 static expert_field ei_ndb_bad_message;
 static expert_field ei_ndb_bad_checksum;
 static expert_field ei_ndb_fragment;
+static expert_field ei_ndb_unjoined;
 static expert_field ei_ndb_compressed;
 static expert_field ei_ndb_short;
 
@@ -659,7 +683,41 @@ typedef struct {
     bool     binary[2];
     /* Has the client asked for a signal link? */
     bool     linking;
+    /* Trains of fragments begun and not yet ended, each way, by sender
+     * block and fragment id. */
+    wmem_map_t *trains[2];
 } ndb_conv_t;
+
+/* A train of fragments, being joined or joined. */
+typedef struct {
+    /* The bytes of each section so far, by section number. */
+    wmem_array_t *pieces[NDB_MAX_SECTIONS];
+    /* The frame each fragment came in. */
+    wmem_array_t *frames;
+    unsigned      fragments;
+    /* The highest section number seen, plus one. */
+    unsigned      sections;
+    /* The frame of the last fragment, once it has come. */
+    uint32_t      joined_in;
+    /* The joined signal as a whole message, once it can be made. */
+    uint8_t      *joined;
+    unsigned      joined_words;
+    unsigned      encoding;
+} ndb_train_t;
+
+/* What a fragment was found to belong to, kept for later passes. */
+typedef struct {
+    /* NULL when its train began before the capture. */
+    ndb_train_t *train;
+    bool         last;
+} ndb_piece_t;
+
+/* Where a message lies, for what is kept about it between passes. */
+typedef struct {
+    ndb_conv_t *conv;
+    int         dir;
+    unsigned    key;
+} ndb_msg_ctx_t;
 
 /* What a call for a frame started from, kept for later passes. */
 typedef struct {
@@ -782,6 +840,7 @@ typedef struct {
     unsigned    offset;     /* of the next word */
     unsigned    left;       /* words of data not yet shown */
     unsigned    encoding;
+    unsigned    sections;   /* how many the message carries */
 } ndb_words_t;
 
 static bool
@@ -1138,7 +1197,10 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
     case NDB_SIG_ROW_DATA_REP:
         ndb_word(w, hf_ndb_query_ref);
         ndb_trans_id(w);
-        if (w->left > 0) {
+        if (w->sections > 0) {
+            /* The long form: the row is section 0, this its length. */
+            ndb_word(w, hf_ndb_row_len);
+        } else if (w->left > 0) {
             ndb_words_t row = *w;
             proto_item *ri = proto_tree_add_item(w->tree, hf_ndb_row, w->tvb,
                                                  w->offset, w->left * 4,
@@ -1485,9 +1547,138 @@ ndb_bundle(ndb_words_t *w, uint32_t signal, packet_info *pinfo)
     col_append_fstr(pinfo->cinfo, COL_INFO, " (%u parts)", part);
 }
 
+/* ---- Trains of fragments ---- */
+
+static void
+ndb_put_word(uint8_t *p, uint32_t value, unsigned encoding)
+{
+    if (encoding == ENC_BIG_ENDIAN)
+        phtonu32(p, value);
+    else
+        phtoleu32(p, value);
+}
+
+/*
+ * Make the joined signal of a train whose last fragment has come: a
+ * whole message, in the sender's byte order, of the last fragment's own
+ * data (own words at data_at) and the joined sections. Without a signal
+ * id or a checksum. Left undone if it would not fit a length field.
+ */
+static void
+ndb_train_join(tvbuff_t *tvb, ndb_train_t *train, uint32_t w1, uint32_t w2,
+               uint32_t w3, unsigned data_at, unsigned own)
+{
+    unsigned words = NDB_HEADER_WORDS + own + train->sections;
+    unsigned i;
+    uint8_t *p;
+
+    for (i = 0; i < train->sections; i++)
+        words += wmem_array_get_count(train->pieces[i]) / 4;
+    if (words > NDB_MAX_JOINED_WORDS)
+        return;
+    train->joined = (uint8_t *)wmem_alloc(wmem_file_scope(), 4 * words);
+    train->joined_words = words;
+    p = train->joined;
+    ndb_put_word(p, (w1 & (NDB_W1_BYTE_ORDER | NDB_W1_PRIO)) |
+                    ((words << 8) & NDB_W1_TOTAL_WORDS) |
+                    ((own << 26) & NDB_W1_DATA_WORDS), train->encoding);
+    p += 4;
+    ndb_put_word(p, (w2 & (NDB_W2_SIGNAL | NDB_W2_VERSION | NDB_W2_TRACE)) |
+                    ((train->sections << 26) & NDB_W2_SECTIONS),
+                 train->encoding);
+    p += 4;
+    ndb_put_word(p, w3, train->encoding);
+    p += 4;
+    tvb_memcpy(tvb, p, data_at, 4 * own);
+    p += 4 * own;
+    for (i = 0; i < train->sections; i++) {
+        ndb_put_word(p, wmem_array_get_count(train->pieces[i]) / 4,
+                     train->encoding);
+        p += 4;
+    }
+    for (i = 0; i < train->sections; i++) {
+        unsigned bytes = wmem_array_get_count(train->pieces[i]);
+
+        if (bytes > 0)
+            memcpy(p, wmem_array_get_raw(train->pieces[i]), bytes);
+        p += bytes;
+    }
+}
+
+/*
+ * On the first pass, add a fragment to its train: a first fragment
+ * begins one, any other goes on the one its sender block and fragment
+ * id name, and the last joins it. The fragment's numbers and id are the
+ * last 1 + sections of its data words; any before them are its own.
+ */
+static ndb_piece_t *
+ndb_train_add(tvbuff_t *tvb, packet_info *pinfo, const ndb_msg_ctx_t *ctx,
+              unsigned fragment, uint32_t w1, uint32_t w2, uint32_t w3,
+              unsigned data_at, unsigned data_words, unsigned sections,
+              const unsigned *section_at, const unsigned *section_len,
+              unsigned encoding)
+{
+    ndb_piece_t *piece = wmem_new0(wmem_file_scope(), ndb_piece_t);
+    unsigned numbers_at;
+    wmem_map_t *map = ctx->conv->trains[ctx->dir];
+    ndb_train_t *train;
+    uint64_t *key;
+    uint32_t frame = pinfo->num;
+    unsigned i;
+
+    if (data_words < sections + 1)
+        return piece;
+    numbers_at = data_at + 4 * (data_words - 1 - sections);
+    if (map == NULL) {
+        map = wmem_map_new(wmem_file_scope(), g_int64_hash, g_int64_equal);
+        ctx->conv->trains[ctx->dir] = map;
+    }
+    key = wmem_new(wmem_file_scope(), uint64_t);
+    *key = ((uint64_t)(w3 & NDB_W3_SENDER) << 32) |
+           tvb_get_uint32(tvb, data_at + 4 * (data_words - 1), encoding);
+    if (fragment == NDB_FRAGMENT_FIRST) {
+        /* A train left unfinished under the same id is dropped. */
+        train = wmem_new0(wmem_file_scope(), ndb_train_t);
+        for (i = 0; i < NDB_MAX_SECTIONS; i++)
+            train->pieces[i] = wmem_array_new(wmem_file_scope(), 1);
+        train->frames = wmem_array_new(wmem_file_scope(), sizeof(uint32_t));
+        train->encoding = encoding;
+        wmem_map_insert(map, key, train);
+    } else {
+        train = (ndb_train_t *)wmem_map_lookup(map, key);
+        if (train == NULL)
+            return piece;
+    }
+    for (i = 0; i < sections; i++) {
+        uint32_t number = tvb_get_uint32(tvb, numbers_at + 4 * i, encoding);
+
+        if (number >= NDB_MAX_SECTIONS)
+            continue;
+        if (section_len[i] > 0)
+            wmem_array_append(train->pieces[number],
+                              tvb_get_ptr(tvb, section_at[i],
+                                          4 * section_len[i]),
+                              4 * section_len[i]);
+        if (number + 1 > train->sections)
+            train->sections = number + 1;
+    }
+    wmem_array_append_one(train->frames, frame);
+    train->fragments++;
+    piece->train = train;
+    if (fragment == NDB_FRAGMENT_LAST) {
+        piece->last = true;
+        train->joined_in = frame;
+        ndb_train_join(tvb, train, w1, w2, w3, data_at,
+                       data_words - 1 - sections);
+        wmem_map_remove(map, key);
+    }
+    return piece;
+}
+
 static void
 ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
-            unsigned offset, unsigned words, unsigned encoding)
+            unsigned offset, unsigned words, unsigned encoding,
+            const ndb_msg_ctx_t *ctx, const ndb_train_t *joined)
 {
     uint32_t w1 = tvb_get_uint32(tvb, offset, encoding);
     uint32_t w2 = tvb_get_uint32(tvb, offset + 4, encoding);
@@ -1504,21 +1695,48 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
     unsigned at = offset + 12;
     unsigned end = offset + 4 * words;
     unsigned section_len[NDB_MAX_SECTIONS] = { 0 };
+    unsigned section_at[NDB_MAX_SECTIONS] = { 0 };
     unsigned data_at = 0;
     unsigned i;
     proto_tree *msg_tree;
     proto_item *msg_item;
     proto_item *ti;
 
-    if (try_val_to_str(signal, ndb_signal_vals) != NULL)
-        col_append_sep_str(pinfo->cinfo, COL_INFO, ", ", name);
-    else
-        col_append_sep_fstr(pinfo->cinfo, COL_INFO, ", ", "signal %u", signal);
+    if (joined != NULL) {
+        unsigned n = wmem_array_get_count(joined->frames);
+        uint32_t *frames = (uint32_t *)wmem_array_get_raw(joined->frames);
+        uint32_t shown = 0;
 
-    msg_tree = proto_tree_add_subtree_format(tree, tvb, offset, 4 * words,
-            ett_ndb_message, &msg_item, "%s (signal %u), %u words",
-            try_val_to_str(signal, ndb_signal_vals) ? name : "Signal",
-            signal, words);
+        col_append_fstr(pinfo->cinfo, COL_INFO, " (joined from %u)",
+                        joined->fragments);
+        msg_tree = proto_tree_add_subtree_format(tree, tvb, offset,
+                4 * words, ett_ndb_message, &msg_item,
+                "Joined %s (signal %u), %u words from %u fragments",
+                try_val_to_str(signal, ndb_signal_vals) ? name : "signal",
+                signal, words, joined->fragments);
+        ti = proto_tree_add_uint(msg_tree, hf_ndb_train_fragments, tvb, 0, 0,
+                                 joined->fragments);
+        proto_item_set_generated(ti);
+        for (i = 0; i < n; i++) {
+            if (frames[i] == shown)
+                continue;
+            shown = frames[i];
+            ti = proto_tree_add_uint(msg_tree, hf_ndb_train_frame, tvb, 0, 0,
+                                     shown);
+            proto_item_set_generated(ti);
+        }
+    } else {
+        if (try_val_to_str(signal, ndb_signal_vals) != NULL)
+            col_append_sep_str(pinfo->cinfo, COL_INFO, ", ", name);
+        else
+            col_append_sep_fstr(pinfo->cinfo, COL_INFO, ", ", "signal %u",
+                                signal);
+        msg_tree = proto_tree_add_subtree_format(tree, tvb, offset,
+                4 * words, ett_ndb_message, &msg_item,
+                "%s (signal %u), %u words",
+                try_val_to_str(signal, ndb_signal_vals) ? name : "Signal",
+                signal, words);
+    }
     proto_tree_add_bitmask(msg_tree, tvb, offset, hf_ndb_word1, ett_ndb_word1,
                            ndb_word1_fields, encoding);
     ti = proto_tree_add_uint(msg_tree, hf_ndb_fragment, tvb, offset, 4,
@@ -1553,6 +1771,7 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
         w.offset = at;
         w.left = data_words;
         w.encoding = encoding;
+        w.sections = sections;
         if (fragment != 0) {
             /*
              * The last word is the fragment id; before it, one section
@@ -1612,6 +1831,7 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
                         data_at + 4 * (data_words - 1 - sections + i),
                         encoding);
             what = ndb_section_name(signal, number);
+            section_at[i] = at;
             ti = proto_tree_add_item(sec_tree, hf_ndb_section, tvb, at,
                                      4 * section_len[i], ENC_NA);
             if (what != NULL)
@@ -1629,6 +1849,7 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
             sw.offset = at;
             sw.left = section_len[i];
             sw.encoding = encoding;
+            sw.sections = 0;
             if (signal == NDB_SIG_LIST_OBJECTS_CONF) {
                 /*
                  * A piece is 240 words, so it holds whole objects of
@@ -1675,6 +1896,43 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
         if (tvb_get_uint32(tvb, end - 4, encoding) != sum)
             expert_add_info_format(pinfo, ti, &ei_ndb_bad_checksum,
                                    "Should be 0x%08x", sum);
+    }
+
+    if (fragment != 0 && ctx != NULL) {
+        ndb_piece_t *piece = (ndb_piece_t *)p_get_proto_data(
+                wmem_file_scope(), pinfo, proto_ndb, ctx->key);
+        ndb_train_t *train;
+
+        if (piece == NULL && !PINFO_FD_VISITED(pinfo)) {
+            piece = ndb_train_add(tvb, pinfo, ctx, fragment, w1, w2, w3,
+                                  data_at, data_words, sections, section_at,
+                                  section_len, encoding);
+            p_add_proto_data(wmem_file_scope(), pinfo, proto_ndb, ctx->key,
+                             piece);
+        }
+        if (piece == NULL)
+            return;
+        train = piece->train;
+        if (train == NULL) {
+            expert_add_info(pinfo, msg_item, &ei_ndb_unjoined);
+        } else if (!piece->last) {
+            if (train->joined_in != 0) {
+                ti = proto_tree_add_uint(msg_tree, hf_ndb_joined_in, tvb, 0,
+                                         0, train->joined_in);
+                proto_item_set_generated(ti);
+            }
+        } else if (train->joined == NULL) {
+            expert_add_info_format(pinfo, msg_item, &ei_ndb_unjoined,
+                    "The joined signal would be over %u words",
+                    NDB_MAX_JOINED_WORDS);
+        } else {
+            tvbuff_t *jt = tvb_new_child_real_data(tvb, train->joined,
+                    4 * train->joined_words, 4 * train->joined_words);
+
+            add_new_data_source(pinfo, jt, "Joined signal");
+            ndb_message(jt, pinfo, tree, 0, train->joined_words,
+                        train->encoding, NULL, train);
+        }
     }
     return;
 
@@ -1832,7 +2090,8 @@ ndb_get_conv(packet_info *pinfo)
  * (a reassembled message, then the rest of the segment).
  */
 static const ndb_call_t *
-ndb_call_start(packet_info *pinfo, const ndb_conv_t *conv, int dir)
+ndb_call_start(packet_info *pinfo, const ndb_conv_t *conv, int dir,
+               unsigned *index)
 {
     unsigned *calls = (unsigned *)p_get_proto_data(pinfo->pool, pinfo,
                                                    proto_ndb, NDB_KEY_CALLS);
@@ -1850,6 +2109,7 @@ ndb_call_start(packet_info *pinfo, const ndb_conv_t *conv, int dir)
         call->linking_at_start = conv->linking;
         p_add_proto_data(wmem_file_scope(), pinfo, proto_ndb, *calls, call);
     }
+    *index = *calls;
     (*calls)++;
     return call;
 }
@@ -1860,7 +2120,10 @@ dissect_ndb(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
 {
     ndb_conv_t *conv = ndb_get_conv(pinfo);
     int dir = ndb_direction(conv, pinfo);
-    const ndb_call_t *call = ndb_call_start(pinfo, conv, dir);
+    unsigned call_index;
+    const ndb_call_t *call = ndb_call_start(pinfo, conv, dir, &call_index);
+    ndb_msg_ctx_t ctx;
+    unsigned message = 0;
     bool binary = call->binary_at_start;
     bool linking = call->linking_at_start;
     unsigned length = tvb_reported_length(tvb);
@@ -1868,6 +2131,9 @@ dissect_ndb(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
     proto_tree *ndb_tree;
     proto_item *ndb_item;
 
+    ctx.conv = conv;
+    ctx.dir = dir;
+    ctx.key = 0;
     col_set_str(pinfo->cinfo, COL_PROTOCOL, "NDB");
     col_clear(pinfo->cinfo, COL_INFO);
     ndb_item = proto_tree_add_item(tree, proto_ndb, tvb, 0, -1, ENC_NA);
@@ -1972,7 +2238,11 @@ dissect_ndb(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
                 expert_add_info(pinfo, bad, &ei_ndb_short);
                 break;
             }
-            ndb_message(tvb, pinfo, ndb_tree, offset, words, encoding);
+            ctx.key = NDB_KEY_MESSAGES | (call_index << NDB_KEY_CALL_SHIFT) |
+                      (message & NDB_KEY_MESSAGE_MASK);
+            message++;
+            ndb_message(tvb, pinfo, ndb_tree, offset, words, encoding, &ctx,
+                        NULL);
             offset += 4 * words;
         }
     }
@@ -2096,6 +2366,17 @@ proto_register_ndb(void)
         { &hf_ndb_fragment_id,
           { "Fragment id", "ndb.fragment_id", FT_UINT32, BASE_DEC, NULL, 0x0,
             NULL, HFILL } },
+        { &hf_ndb_joined_in,
+          { "Joined in frame", "ndb.joined_in", FT_FRAMENUM, BASE_NONE, NULL,
+            0x0, "The frame whose message ends this fragment's train",
+            HFILL } },
+        { &hf_ndb_train_fragments,
+          { "Fragments", "ndb.train.fragments", FT_UINT32, BASE_DEC, NULL,
+            0x0, "How many messages the joined signal came in", HFILL } },
+        { &hf_ndb_train_frame,
+          { "Fragment in frame", "ndb.train.frame", FT_FRAMENUM, BASE_NONE,
+            NULL, 0x0, "A frame that carried fragments of the joined signal",
+            HFILL } },
         { &hf_ndb_section_number,
           { "Section number", "ndb.section_number", FT_UINT32, BASE_DEC, NULL,
             0x0, "Which of the signal's sections this fragment carries",
@@ -2300,6 +2581,9 @@ proto_register_ndb(void)
             VALS(ndb_object_kind_vals), 0x0, NULL, HFILL } },
         { &hf_ndb_row,
           { "Row", "ndb.row", FT_BYTES, BASE_NONE, NULL, 0x0, NULL, HFILL } },
+        { &hf_ndb_row_len,
+          { "Row length (words)", "ndb.row_len", FT_UINT32, BASE_DEC, NULL,
+            0x0, "The length of the row that section 0 carries", HFILL } },
         { &hf_ndb_error_line,
           { "Source line", "ndb.error_line", FT_UINT32, BASE_DEC, NULL, 0x0,
             "Where in the data node's source the request was refused",
@@ -2549,8 +2833,12 @@ proto_register_ndb(void)
             "Checksum does not match", EXPFILL } },
         { &ei_ndb_fragment,
           { "ndb.fragment.note", PI_REASSEMBLE, PI_NOTE,
-            "One fragment of a longer signal; fragments are not put "
-            "together yet", EXPFILL } },
+            "One fragment of a longer signal, joined at its last fragment",
+            EXPFILL } },
+        { &ei_ndb_unjoined,
+          { "ndb.fragment.unjoined", PI_REASSEMBLE, PI_WARN,
+            "A fragment whose train began before the capture; not joined",
+            EXPFILL } },
         { &ei_ndb_compressed,
           { "ndb.compressed.note", PI_UNDECODED, PI_NOTE,
             "Compressed message, not decoded", EXPFILL } },
