@@ -68,6 +68,13 @@
  * the last fragment's data is the signal's. The dissector shows each
  * fragment, and at the last one the joined signal, as a data source of
  * its own, with the frames its fragments came in.
+ *
+ * Scans are decoded as iClaustron's protocol chapter (section 7.2) reads
+ * them, which captures are to confirm: SCAN_REQ with its flags and its
+ * three sections (the receivers, the columns after five size words, the
+ * bounds), SCAN_CONF with an entry per receiver, SCAN_REF, SCAN_MORE_REQ
+ * and SCAN_ROW_KEY_REP. A scan's rows are ROW_DATA_REP, whose first word
+ * then names a receiver rather than a query.
  */
 
 #include "config.h"
@@ -123,6 +130,15 @@ static dissector_handle_t ndb_handle;
 #define NDB_BLOCK_CONFIG_SERVICE  0x0FA3
 #define NDB_FIRST_USER_THREAD     0x8000
 #define NDB_BLOCK_NUMBER_BITS     9
+#define NDB_BLOCK_COORDINATOR     0x0F5
+
+/* KEY_OP_REQ's flags for its optional words. */
+#define NDB_FLAG_DIST_KEY         (1U << 2)
+#define NDB_FLAG_TAKEOVER         (1U << 14)
+#define NDB_FLAG_USER_ID          (1U << 29)
+
+/* A signal number whose layout here is not the one we decode. */
+#define NDB_SIG_OTHER             0x10000
 
 /* Column headers: the column id above, the value's size in bytes below. */
 #define NDB_COL_ID                0xFFFF0000
@@ -132,6 +148,15 @@ static dissector_handle_t ndb_handle;
 #define NDB_COL_READ_EVERY        0xFFF0
 #define NDB_COL_READ_MASKED       0xFFF3
 #define NDB_COL_PARTITION         0xFFFE
+
+/* Scans: SCAN_REQ's distribution key flag, SCAN_CONF's receiver count,
+ * the coordinator's pointer for a receiver that is done, and the row
+ * count that says a fourth word holds the rows. */
+#define NDB_SCAN_DIST_KEY         (1U << 26)
+#define NDB_SCAN_CONF_COUNT       0x7FFFFFFF
+#define NDB_NULL_RECORD           0xFFFFFF00
+#define NDB_RECEIVER_ROWS         0x000003FF
+#define NDB_SCAN_SIZE_WORDS       5
 
 /* A data node's state, in HEARTBEAT_CONF: 16 words, the last 8 a bitmap. */
 #define NDB_NODE_STATE_WORDS      16
@@ -324,6 +349,15 @@ static const value_string ndb_operation_vals[] = {
     { 0, NULL }
 };
 
+static const value_string ndb_bound_vals[] = {
+    { 0, "low, inclusive" },
+    { 1, "low, exclusive" },
+    { 2, "high, inclusive" },
+    { 3, "high, exclusive" },
+    { 4, "equal" },
+    { 0, NULL }
+};
+
 static const value_string ndb_abort_vals[] = {
     { 0, "abort on error" },
     { 2, "ignore error" },
@@ -468,6 +502,68 @@ static int hf_ndb_object_count;
 static int hf_ndb_object_flags;
 static int hf_ndb_object_store;
 static int hf_ndb_object_temporary;
+static int hf_ndb_flag_dist_key;
+static int hf_ndb_flag_takeover;
+static int hf_ndb_flag_user_id;
+static int hf_ndb_user_id;
+static int hf_ndb_user_id_version;
+static int hf_ndb_takeover_info;
+static int hf_ndb_takeover_flag;
+static int hf_ndb_takeover_row;
+static int hf_ndb_takeover_frag;
+static int hf_ndb_op_dist_key;
+static int hf_ndb_row_for;
+static int hf_ndb_scan_flags;
+static int hf_ndb_scan_ext;
+static int hf_ndb_scan_exclusive;
+static int hf_ndb_scan_no_disk;
+static int hf_ndb_scan_hold_lock;
+static int hf_ndb_scan_committed;
+static int hf_ndb_scan_keys;
+static int hf_ndb_scan_storage_order;
+static int hf_ndb_scan_descending;
+static int hf_ndb_scan_range;
+static int hf_ndb_scan_batch_rows_bits;
+static int hf_ndb_scan_dist_key;
+static int hf_ndb_scan_join;
+static int hf_ndb_scan_every_conf;
+static int hf_ndb_scan_extended_conf;
+static int hf_ndb_scan_committed_base;
+static int hf_ndb_scan_multi_frag;
+static int hf_ndb_scan_spare;
+static int hf_ndb_scan_word5;
+static int hf_ndb_scan_word5_low;
+static int hf_ndb_scan_word5_per_worker;
+static int hf_ndb_scan_word5_partition;
+static int hf_ndb_scan_word5_interval;
+static int hf_ndb_trans_record;
+static int hf_ndb_batch_bytes;
+static int hf_ndb_batch_rows;
+static int hf_ndb_dist_key;
+static int hf_ndb_receiver_id;
+static int hf_ndb_receiver_coord;
+static int hf_ndb_scan_conf_info;
+static int hf_ndb_scan_conf_count;
+static int hf_ndb_scan_conf_end;
+static int hf_ndb_receiver_info;
+static int hf_ndb_receiver_len;
+static int hf_ndb_receiver_rows;
+static int hf_ndb_receiver_rows_word;
+static int hf_ndb_receiver_len_word;
+static int hf_ndb_receiver_active;
+static int hf_ndb_close_owed;
+static int hf_ndb_stop;
+static int hf_ndb_key_len;
+static int hf_ndb_row_key_info;
+static int hf_ndb_row_key_scan;
+static int hf_ndb_row_key_op;
+static int hf_ndb_row_key_frag;
+static int hf_ndb_key;
+static int hf_ndb_column_size_word;
+static int hf_ndb_bound;
+static int hf_ndb_bound_type;
+static int hf_ndb_bound_range;
+static int hf_ndb_bound_len;
 static int hf_ndb_object_state;
 static int hf_ndb_object_id;
 static int hf_ndb_object_name_len;
@@ -557,6 +653,15 @@ static int ett_ndb_column_header;
 static int ett_ndb_list_flags;
 static int ett_ndb_object;
 static int ett_ndb_object_flags;
+static int ett_ndb_scan_flags;
+static int ett_ndb_scan_word5;
+static int ett_ndb_scan_conf_info;
+static int ett_ndb_receiver;
+static int ett_ndb_receiver_info;
+static int ett_ndb_row_key_info;
+static int ett_ndb_takeover_info;
+static int ett_ndb_bound;
+static int ett_ndb_bound_word;
 
 static expert_field ei_ndb_bad_message;
 static expert_field ei_ndb_bad_checksum;
@@ -601,16 +706,80 @@ static int * const ndb_part_header_fields[] = {
 static int * const ndb_flags_fields[] = {
     &hf_ndb_flag_dirty,
     &hf_ndb_flag_no_disk,
+    &hf_ndb_flag_dist_key,
     &hf_ndb_flag_commit,
     &hf_ndb_flag_operation,
     &hf_ndb_flag_simple,
     &hf_ndb_flag_execute,
     &hf_ndb_flag_start,
     &hf_ndb_flag_abort,
+    &hf_ndb_flag_takeover,
+    &hf_ndb_flag_user_id,
     &hf_ndb_flag_committed_base,
     &hf_ndb_flag_no_wait,
     &hf_ndb_flag_batch_safe,
     &hf_ndb_flag_batch_unsafe,
+    NULL
+};
+
+static int * const ndb_scan_flags_fields[] = {
+    &hf_ndb_scan_ext,
+    &hf_ndb_scan_exclusive,
+    &hf_ndb_scan_no_disk,
+    &hf_ndb_scan_hold_lock,
+    &hf_ndb_scan_committed,
+    &hf_ndb_scan_keys,
+    &hf_ndb_scan_storage_order,
+    &hf_ndb_scan_descending,
+    &hf_ndb_scan_range,
+    &hf_ndb_scan_batch_rows_bits,
+    &hf_ndb_scan_dist_key,
+    &hf_ndb_scan_join,
+    &hf_ndb_scan_every_conf,
+    &hf_ndb_scan_extended_conf,
+    &hf_ndb_scan_committed_base,
+    &hf_ndb_scan_multi_frag,
+    NULL
+};
+
+static int * const ndb_scan_word5_fields[] = {
+    &hf_ndb_scan_word5_low,
+    &hf_ndb_scan_word5_per_worker,
+    &hf_ndb_scan_word5_partition,
+    &hf_ndb_scan_word5_interval,
+    NULL
+};
+
+static int * const ndb_scan_conf_info_fields[] = {
+    &hf_ndb_scan_conf_count,
+    &hf_ndb_scan_conf_end,
+    NULL
+};
+
+static int * const ndb_receiver_info_fields[] = {
+    &hf_ndb_receiver_len,
+    &hf_ndb_receiver_rows,
+    NULL
+};
+
+static int * const ndb_row_key_info_fields[] = {
+    &hf_ndb_row_key_scan,
+    &hf_ndb_row_key_op,
+    &hf_ndb_row_key_frag,
+    NULL
+};
+
+static int * const ndb_takeover_info_fields[] = {
+    &hf_ndb_takeover_flag,
+    &hf_ndb_takeover_row,
+    &hf_ndb_takeover_frag,
+    NULL
+};
+
+static int * const ndb_bound_fields[] = {
+    &hf_ndb_bound_type,
+    &hf_ndb_bound_range,
+    &hf_ndb_bound_len,
     NULL
 };
 
@@ -824,6 +993,17 @@ ndb_format_column_id(char *buf, uint32_t value)
         snprintf(buf, ITEM_LABEL_LENGTH, "%u", value);
         break;
     }
+}
+
+/* The coordinator's pointer for a scan receiver; null once it is done. */
+static void
+ndb_format_receiver_ptr(char *buf, uint32_t value)
+{
+    if (value == NDB_NULL_RECORD)
+        snprintf(buf, ITEM_LABEL_LENGTH, "none, the receiver is done "
+                 "(0x%08x)", value);
+    else
+        snprintf(buf, ITEM_LABEL_LENGTH, "0x%08x", value);
 }
 
 static void
@@ -1123,6 +1303,179 @@ ndb_object_names(ndb_words_t *w)
     }
 }
 
+/*
+ * The form of SCAN_CONF's `count` entries in the words left: 3 for the
+ * short form, where an entry with all ones for rows takes a fourth word;
+ * 4 or 5 for the extended form the request asks for with flag bit 29.
+ * The confirmation does not say which. Five words an entry can only be
+ * the extended form. Four can also be the short form with every entry's
+ * rows in a fourth word, which needs all ones in each third word.
+ */
+static unsigned
+ndb_scan_entry_form(const ndb_words_t *w, unsigned count)
+{
+    unsigned i;
+
+    if (count == 0)
+        return 3;
+    if (w->left == 5 * count)
+        return 5;
+    if (w->left != 4 * count)
+        return 3;
+    for (i = 0; i < count; i++) {
+        uint32_t info = tvb_get_uint32(w->tvb, w->offset + 16 * i + 8,
+                                       w->encoding);
+        if ((info & NDB_RECEIVER_ROWS) != NDB_RECEIVER_ROWS)
+            return 4;
+    }
+    return 3;
+}
+
+/*
+ * SCAN_CONF's entries, one per receiver reported: its id and the
+ * coordinator's pointer for it, then its batch. In the short form the
+ * batch is one word, its length in words above bit 10 and its rows
+ * below, rows all ones meaning a fourth word holds them. In the
+ * extended form the rows and the length are words of their own, and an
+ * API of 8.0.20 or later gets a fifth, the join's active mask. At most
+ * `count`, as the confirmation's own word says.
+ */
+static void
+ndb_scan_entries(ndb_words_t *w, unsigned count)
+{
+    unsigned form = ndb_scan_entry_form(w, count);
+    unsigned n = 0;
+
+    while (w->left >= form && n < count) {
+        unsigned at = w->offset;
+        uint32_t third = tvb_get_uint32(w->tvb, at + 8, w->encoding);
+        uint32_t rows;
+        uint32_t len;
+        unsigned words = form;
+        ndb_words_t entry = *w;
+        proto_item *ei;
+        uint32_t id;
+
+        if (form == 3) {
+            rows = third & NDB_RECEIVER_ROWS;
+            len = third >> 10;
+            if (rows == NDB_RECEIVER_ROWS && w->left >= 4) {
+                words = 4;
+                rows = tvb_get_uint32(w->tvb, at + 12, w->encoding);
+            }
+        } else {
+            rows = third;
+            len = tvb_get_uint32(w->tvb, at + 12, w->encoding);
+        }
+        n++;
+        entry.tree = proto_tree_add_subtree_format(w->tree, w->tvb, at,
+                4 * words, ett_ndb_receiver, &ei, "Receiver %u", n);
+        entry.left = words;
+        id = ndb_word(&entry, hf_ndb_receiver_id);
+        ndb_word(&entry, hf_ndb_receiver_coord);
+        if (form == 3) {
+            ndb_bits(&entry, hf_ndb_receiver_info, ett_ndb_receiver_info,
+                     ndb_receiver_info_fields);
+            if (words == 4)
+                ndb_word(&entry, hf_ndb_receiver_rows_word);
+        } else {
+            ndb_word(&entry, hf_ndb_receiver_rows_word);
+            ndb_word(&entry, hf_ndb_receiver_len_word);
+            if (form == 5)
+                ndb_word(&entry, hf_ndb_receiver_active);
+        }
+        proto_item_append_text(ei, ": id 0x%08x, %u rows in %u words", id,
+                               rows, len);
+        w->offset += 4 * words;
+        w->left -= words;
+    }
+    ndb_rest(w);
+}
+
+/*
+ * SCAN_REQ's column section: five size words, then the columns to read,
+ * as many words as the first size says; what follows is shown as words.
+ */
+static void
+ndb_scan_columns(ndb_words_t *w)
+{
+    uint32_t first = 0;
+    unsigned i;
+    ndb_words_t list;
+    unsigned used;
+
+    for (i = 0; i < NDB_SCAN_SIZE_WORDS && w->left > 0; i++) {
+        unsigned at = w->offset;
+        proto_item *ti;
+        uint32_t value = tvb_get_uint32(w->tvb, at, w->encoding);
+
+        if (i == 0)
+            first = value;
+        ti = proto_tree_add_item(w->tree, hf_ndb_column_size_word, w->tvb,
+                                 at, 4, w->encoding);
+        proto_item_append_text(ti, " (size word %u)", i + 1);
+        w->offset += 4;
+        w->left--;
+    }
+    list = *w;
+    used = first < w->left ? first : w->left;
+    list.left = used;
+    ndb_columns(&list, false);
+    w->offset += 4 * used;
+    w->left -= used;
+    ndb_rest(w);
+}
+
+/*
+ * SCAN_REQ's bounds: per bound a word with its type, and in a range's
+ * first word also the range's number and length, then a column header
+ * (the column's id in the index, the value's bytes) and the value
+ * padded to whole words.
+ */
+static void
+ndb_bounds(ndb_words_t *w)
+{
+    while (w->left > 0) {
+        unsigned at = w->offset;
+        uint32_t word = tvb_get_uint32(w->tvb, at, w->encoding);
+        uint32_t header = 0;
+        unsigned words = 0;
+        proto_tree *bt;
+        proto_item *bi;
+
+        bt = proto_tree_add_subtree(w->tree, w->tvb, at, 4, ett_ndb_bound,
+                                    &bi, "Bound");
+        proto_tree_add_bitmask(bt, w->tvb, at, hf_ndb_bound,
+                               ett_ndb_bound_word, ndb_bound_fields,
+                               w->encoding);
+        w->offset += 4;
+        w->left--;
+        if (w->left > 0) {
+            header = tvb_get_uint32(w->tvb, w->offset, w->encoding);
+            proto_tree_add_bitmask(bt, w->tvb, w->offset,
+                                   hf_ndb_column_header,
+                                   ett_ndb_column_header,
+                                   ndb_column_header_fields, w->encoding);
+            w->offset += 4;
+            w->left--;
+            words = ((header & NDB_COL_SIZE) + 3) / 4;
+            if (words > w->left)
+                words = w->left;
+        }
+        if (words > 0) {
+            proto_tree_add_item(bt, hf_ndb_column_value, w->tvb, w->offset,
+                                4 * words, ENC_NA);
+            w->offset += 4 * words;
+            w->left -= words;
+        }
+        proto_item_set_len(bi, (int)(w->offset - at));
+        proto_item_set_text(bi, "Bound %s, column %u, %u bytes",
+                            val_to_str_const(word & 0xF, ndb_bound_vals,
+                                             "of another type"),
+                            header >> 16, header & NDB_COL_SIZE);
+    }
+}
+
 /* Data words, by signal; whatever is not named is shown as words. */
 static void
 ndb_signal_data(ndb_words_t *w, uint32_t signal)
@@ -1131,6 +1484,8 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
     unsigned ops;
     unsigned gci_at;
     uint32_t gci_hi;
+    uint32_t flags;
+    uint32_t count;
     proto_tree *op_tree;
 
     switch (signal) {
@@ -1160,9 +1515,25 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
         ndb_word(w, hf_ndb_query_ref);
         ndb_word(w, hf_ndb_column_data_len);
         ndb_word(w, hf_ndb_table_id);
-        ndb_bits(w, hf_ndb_flags, ett_ndb_flags, ndb_flags_fields);
+        flags = ndb_bits(w, hf_ndb_flags, ett_ndb_flags, ndb_flags_fields);
         ndb_word(w, hf_ndb_table_version);
         ndb_trans_id(w);
+        /*
+         * A long KEY_OP_REQ's optional words, each only when its flag is
+         * set and in this order: the user id and its version, a
+         * takeover's scan information, the distribution key.
+         */
+        if (signal == NDB_SIG_KEY_OP_REQ && w->sections > 0) {
+            if (flags & NDB_FLAG_USER_ID) {
+                ndb_word(w, hf_ndb_user_id);
+                ndb_word(w, hf_ndb_user_id_version);
+            }
+            if (flags & NDB_FLAG_TAKEOVER)
+                ndb_bits(w, hf_ndb_takeover_info, ett_ndb_takeover_info,
+                         ndb_takeover_info_fields);
+            if (flags & NDB_FLAG_DIST_KEY)
+                ndb_word(w, hf_ndb_op_dist_key);
+        }
         break;
     case NDB_SIG_KEY_OP_CONF:
     case NDB_SIG_UNIQUE_OP_CONF:
@@ -1195,7 +1566,7 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
         ndb_word(w, hf_ndb_error_data);
         break;
     case NDB_SIG_ROW_DATA_REP:
-        ndb_word(w, hf_ndb_query_ref);
+        ndb_word(w, hf_ndb_row_for);
         ndb_trans_id(w);
         if (w->sections > 0) {
             /* The long form: the row is section 0, this its length. */
@@ -1215,6 +1586,56 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
     case NDB_SIG_ROLLBACK_REQ:
         ndb_word(w, hf_ndb_coord_ptr);
         ndb_trans_id(w);
+        break;
+    case NDB_SIG_SCAN_REQ:
+        ndb_word(w, hf_ndb_coord_ptr);
+        ndb_word(w, hf_ndb_scan_spare);
+        flags = ndb_bits(w, hf_ndb_scan_flags, ett_ndb_scan_flags,
+                         ndb_scan_flags_fields);
+        ndb_word(w, hf_ndb_table_id);
+        ndb_word(w, hf_ndb_table_version);
+        ndb_bits(w, hf_ndb_scan_word5, ett_ndb_scan_word5,
+                 ndb_scan_word5_fields);
+        ndb_trans_id(w);
+        ndb_word(w, hf_ndb_trans_record);
+        ndb_word(w, hf_ndb_batch_bytes);
+        ndb_word(w, hf_ndb_batch_rows);
+        if (flags & NDB_SCAN_DIST_KEY)
+            ndb_word(w, hf_ndb_dist_key);
+        break;
+    case NDB_SIG_SCAN_CONF:
+        ndb_word(w, hf_ndb_client_ptr);
+        count = ndb_bits(w, hf_ndb_scan_conf_info, ett_ndb_scan_conf_info,
+                         ndb_scan_conf_info_fields) & NDB_SCAN_CONF_COUNT;
+        ndb_trans_id(w);
+        if (w->sections == 0)
+            ndb_scan_entries(w, count);
+        break;
+    case NDB_SIG_SCAN_REF:
+        ndb_word(w, hf_ndb_client_ptr);
+        ndb_trans_id(w);
+        ndb_word(w, hf_ndb_error_code);
+        ndb_word(w, hf_ndb_close_owed);
+        break;
+    case NDB_SIG_SCAN_MORE_REQ:
+        ndb_word(w, hf_ndb_coord_ptr);
+        ndb_word(w, hf_ndb_stop);
+        ndb_trans_id(w);
+        while (w->left > 0)
+            ndb_word(w, hf_ndb_receiver_coord);
+        break;
+    case NDB_SIG_SCAN_ROW_KEY_REP:
+        ndb_word(w, hf_ndb_receiver_id);
+        ndb_word(w, hf_ndb_key_len);
+        ndb_bits(w, hf_ndb_row_key_info, ett_ndb_row_key_info,
+                 ndb_row_key_info_fields);
+        ndb_trans_id(w);
+        if (w->left > 0) {
+            proto_tree_add_item(w->tree, hf_ndb_key, w->tvb, w->offset,
+                                4 * w->left, ENC_NA);
+            w->offset += 4 * w->left;
+            w->left = 0;
+        }
         break;
     case NDB_SIG_COMMIT_CONF:
         ndb_client_ptr_flagged(w);
@@ -1374,6 +1795,14 @@ ndb_section_name(uint32_t signal, unsigned part)
         return part == 0 ? "key" : (part == 1 ? "columns" : NULL);
     case NDB_SIG_ROW_DATA_REP:
         return part == 0 ? "row" : NULL;
+    case NDB_SIG_SCAN_REQ:
+        return part == 0 ? "receivers" :
+               (part == 1 ? "columns" : (part == 2 ? "bounds" : NULL));
+    case NDB_SIG_SCAN_CONF:
+    case NDB_SIG_SCAN_MORE_REQ:
+        return part == 0 ? "receivers" : NULL;
+    case NDB_SIG_SCAN_ROW_KEY_REP:
+        return part == 0 ? "key" : NULL;
     case NDB_SIG_LIST_OBJECTS_CONF:
         return part == 0 ? "objects" : (part == 1 ? "names" : NULL);
     case NDB_SIG_TABLE_DESC_REQ:
@@ -1675,6 +2104,22 @@ ndb_train_add(tvbuff_t *tvb, packet_info *pinfo, const ndb_msg_ctx_t *ctx,
     return piece;
 }
 
+/*
+ * The layout a signal number has here. Signal 28 is SCAN_MORE_REQ only
+ * on its way to the coordinator; between data nodes the same number has
+ * another layout, shown as words.
+ */
+static uint32_t
+ndb_layout(uint32_t signal, uint32_t receiver)
+{
+    if (signal == NDB_SIG_SCAN_MORE_REQ &&
+        (receiver >= NDB_FIRST_USER_THREAD ||
+         (receiver & ((1U << NDB_BLOCK_NUMBER_BITS) - 1)) !=
+             NDB_BLOCK_COORDINATOR))
+        return NDB_SIG_OTHER;
+    return signal;
+}
+
 static void
 ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
             unsigned offset, unsigned words, unsigned encoding,
@@ -1683,8 +2128,9 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
     uint32_t w1 = tvb_get_uint32(tvb, offset, encoding);
     uint32_t w2 = tvb_get_uint32(tvb, offset + 4, encoding);
     uint32_t w3 = tvb_get_uint32(tvb, offset + 8, encoding);
-    uint32_t signal = w2 & NDB_W2_SIGNAL;
+    uint32_t gsn = w2 & NDB_W2_SIGNAL;
     uint32_t receiver = (w3 & NDB_W3_RECEIVER) >> 16;
+    uint32_t signal = ndb_layout(gsn, receiver);
     unsigned data_words = (w1 & NDB_W1_DATA_WORDS) >> 26;
     unsigned sections = (w2 & NDB_W2_SECTIONS) >> 26;
     unsigned fragment = ((w1 & NDB_W1_FRAG_HIGH) ? 2 : 0) |
@@ -1713,7 +2159,7 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
                 4 * words, ett_ndb_message, &msg_item,
                 "Joined %s (signal %u), %u words from %u fragments",
                 try_val_to_str(signal, ndb_signal_vals) ? name : "signal",
-                signal, words, joined->fragments);
+                gsn, words, joined->fragments);
         ti = proto_tree_add_uint(msg_tree, hf_ndb_train_fragments, tvb, 0, 0,
                                  joined->fragments);
         proto_item_set_generated(ti);
@@ -1730,12 +2176,12 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
             col_append_sep_str(pinfo->cinfo, COL_INFO, ", ", name);
         else
             col_append_sep_fstr(pinfo->cinfo, COL_INFO, ", ", "signal %u",
-                                signal);
+                                gsn);
         msg_tree = proto_tree_add_subtree_format(tree, tvb, offset,
                 4 * words, ett_ndb_message, &msg_item,
                 "%s (signal %u), %u words",
                 try_val_to_str(signal, ndb_signal_vals) ? name : "Signal",
-                signal, words);
+                gsn, words);
     }
     proto_tree_add_bitmask(msg_tree, tvb, offset, hf_ndb_word1, ett_ndb_word1,
                            ndb_word1_fields, encoding);
@@ -1871,6 +2317,26 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
                 } else if (signal == NDB_SIG_ROW_DATA_REP && number == 0) {
                     sw.tree = proto_item_add_subtree(ti, ett_ndb_row);
                     ndb_columns(&sw, true);
+                } else if (signal == NDB_SIG_SCAN_REQ && number == 0) {
+                    sw.tree = proto_item_add_subtree(ti, ett_ndb_receiver);
+                    while (sw.left > 0)
+                        ndb_word(&sw, hf_ndb_receiver_id);
+                } else if (signal == NDB_SIG_SCAN_REQ && number == 1) {
+                    sw.tree = proto_item_add_subtree(ti, ett_ndb_row);
+                    ndb_scan_columns(&sw);
+                } else if (signal == NDB_SIG_SCAN_REQ && number == 2) {
+                    sw.tree = proto_item_add_subtree(ti, ett_ndb_bound);
+                    ndb_bounds(&sw);
+                } else if (signal == NDB_SIG_SCAN_CONF && number == 0 &&
+                           data_words >= 2) {
+                    sw.tree = proto_item_add_subtree(ti, ett_ndb_receiver);
+                    ndb_scan_entries(&sw,
+                            tvb_get_uint32(tvb, data_at + 4, encoding) &
+                            NDB_SCAN_CONF_COUNT);
+                } else if (signal == NDB_SIG_SCAN_MORE_REQ && number == 0) {
+                    sw.tree = proto_item_add_subtree(ti, ett_ndb_receiver);
+                    while (sw.left > 0)
+                        ndb_word(&sw, hf_ndb_receiver_coord);
                 }
             }
             if (signal == NDB_SIG_COLLATION_DESC_CONF && number == 1 &&
@@ -2789,6 +3255,199 @@ proto_register_ndb(void)
         { &hf_ndb_coll_error,
           { "Error", "ndb.collation.error", FT_UINT32, BASE_DEC,
             VALS(ndb_collation_error_vals), 0x0, NULL, HFILL } },
+        { &hf_ndb_flag_dist_key,
+          { "Distribution key given", "ndb.flags.dist_key", FT_BOOLEAN, 32,
+            NULL, 1U << 2, NULL, HFILL } },
+        { &hf_ndb_flag_takeover,
+          { "Scan takeover", "ndb.flags.takeover", FT_BOOLEAN, 32, NULL,
+            1U << 14, "Takes over the lock a scan holds on the row", HFILL } },
+        { &hf_ndb_flag_user_id,
+          { "User id given", "ndb.flags.user_id", FT_BOOLEAN, 32, NULL,
+            1U << 29, "For the data nodes' rate limits", HFILL } },
+        { &hf_ndb_user_id,
+          { "User id", "ndb.user_id", FT_UINT32, BASE_DEC, NULL, 0x0, NULL,
+            HFILL } },
+        { &hf_ndb_user_id_version,
+          { "User id version", "ndb.user_id_version", FT_UINT32, BASE_DEC,
+            NULL, 0x0, NULL, HFILL } },
+        { &hf_ndb_takeover_info,
+          { "Scan information", "ndb.takeover", FT_UINT32, BASE_HEX, NULL,
+            0x0, "Which scanned row the takeover names", HFILL } },
+        { &hf_ndb_takeover_flag,
+          { "Takeover", "ndb.takeover.flag", FT_BOOLEAN, 32, NULL,
+            0x00000001, NULL, HFILL } },
+        { &hf_ndb_takeover_row,
+          { "Row", "ndb.takeover.row", FT_UINT32, BASE_HEX, NULL,
+            0x0007FFFE, "The row word of the row's SCAN_ROW_KEY_REP, its low "
+            "18 bits", HFILL } },
+        { &hf_ndb_takeover_frag,
+          { "Fragment", "ndb.takeover.fragment", FT_UINT32, BASE_DEC, NULL,
+            0xFFF00000, NULL, HFILL } },
+        { &hf_ndb_op_dist_key,
+          { "Distribution key", "ndb.dist_key", FT_UINT32, BASE_HEX, NULL,
+            0x0, "For a takeover, the row's fragment", HFILL } },
+        { &hf_ndb_row_for,
+          { "Query or receiver", "ndb.row_for", FT_UINT32, BASE_HEX, NULL,
+            0x0, "The client's id for the query the row answers, or for "
+            "the scan receiver it is for", HFILL } },
+        { &hf_ndb_scan_flags,
+          { "Scan flags", "ndb.scan.flags", FT_UINT32, BASE_HEX, NULL, 0x0,
+            NULL, HFILL } },
+        { &hf_ndb_scan_ext,
+          { "Extensions", "ndb.scan.flags.ext", FT_UINT32, BASE_HEX, NULL,
+            0x000000FF, NULL, HFILL } },
+        { &hf_ndb_scan_exclusive,
+          { "Exclusive lock", "ndb.scan.flags.exclusive", FT_BOOLEAN, 32,
+            NULL, 1U << 8, NULL, HFILL } },
+        { &hf_ndb_scan_no_disk,
+          { "No disk", "ndb.scan.flags.no_disk", FT_BOOLEAN, 32, NULL,
+            1U << 9, NULL, HFILL } },
+        { &hf_ndb_scan_hold_lock,
+          { "Hold lock", "ndb.scan.flags.hold_lock", FT_BOOLEAN, 32, NULL,
+            1U << 10, NULL, HFILL } },
+        { &hf_ndb_scan_committed,
+          { "Read committed", "ndb.scan.flags.committed", FT_BOOLEAN, 32,
+            NULL, 1U << 11, NULL, HFILL } },
+        { &hf_ndb_scan_keys,
+          { "Return each row's key", "ndb.scan.flags.keys", FT_BOOLEAN, 32,
+            NULL, 1U << 12, "For takeover: a SCAN_ROW_KEY_REP per row",
+            HFILL } },
+        { &hf_ndb_scan_storage_order,
+          { "Storage order", "ndb.scan.flags.storage_order", FT_BOOLEAN, 32,
+            NULL, 1U << 13, NULL, HFILL } },
+        { &hf_ndb_scan_descending,
+          { "Descending", "ndb.scan.flags.descending", FT_BOOLEAN, 32, NULL,
+            1U << 14, NULL, HFILL } },
+        { &hf_ndb_scan_range,
+          { "Range scan", "ndb.scan.flags.range", FT_BOOLEAN, 32, NULL,
+            1U << 15, NULL, HFILL } },
+        { &hf_ndb_scan_batch_rows_bits,
+          { "Batch rows", "ndb.scan.flags.batch_rows", FT_UINT32, BASE_DEC,
+            NULL, 0x03FF0000, "0: the first batch's word says", HFILL } },
+        { &hf_ndb_scan_dist_key,
+          { "Distribution key given", "ndb.scan.flags.dist_key",
+            FT_BOOLEAN, 32, NULL, 1U << 26, NULL, HFILL } },
+        { &hf_ndb_scan_join,
+          { "Join", "ndb.scan.flags.join", FT_BOOLEAN, 32, NULL, 1U << 27,
+            NULL, HFILL } },
+        { &hf_ndb_scan_every_conf,
+          { "Pass every confirmation", "ndb.scan.flags.every_conf",
+            FT_BOOLEAN, 32, NULL, 1U << 28, NULL, HFILL } },
+        { &hf_ndb_scan_extended_conf,
+          { "Extended confirmation", "ndb.scan.flags.extended_conf",
+            FT_BOOLEAN, 32, NULL, 1U << 29, NULL, HFILL } },
+        { &hf_ndb_scan_committed_base,
+          { "Read committed base", "ndb.scan.flags.committed_base",
+            FT_BOOLEAN, 32, NULL, 1U << 30, NULL, HFILL } },
+        { &hf_ndb_scan_multi_frag,
+          { "Several fragments per receiver", "ndb.scan.flags.multi_frag",
+            FT_BOOLEAN, 32, NULL, 1U << 31, NULL, HFILL } },
+        { &hf_ndb_scan_spare,
+          { "Spare", "ndb.scan.spare", FT_UINT32, BASE_HEX, NULL, 0x0, NULL,
+            HFILL } },
+        { &hf_ndb_scan_word5,
+          { "Word 5", "ndb.scan.word5", FT_UINT32, BASE_HEX, NULL, 0x0, NULL,
+            HFILL } },
+        { &hf_ndb_scan_word5_low,
+          { "Low half", "ndb.scan.word5.low", FT_UINT32, BASE_HEX, NULL,
+            0x0000FFFF, NULL, HFILL } },
+        { &hf_ndb_scan_word5_per_worker,
+          { "Fragments per worker", "ndb.scan.word5.per_worker", FT_UINT32,
+            BASE_DEC, NULL, 0x00030000, NULL, HFILL } },
+        { &hf_ndb_scan_word5_partition,
+          { "Partition given", "ndb.scan.word5.partition", FT_BOOLEAN, 32,
+            NULL, 1U << 30, NULL, HFILL } },
+        { &hf_ndb_scan_word5_interval,
+          { "Hash interval", "ndb.scan.word5.interval", FT_BOOLEAN, 32, NULL,
+            1U << 31, NULL, HFILL } },
+        { &hf_ndb_trans_record,
+          { "Transaction's coordinator record", "ndb.scan.trans_record",
+            FT_UINT32, BASE_HEX, NULL, 0x0,
+            "The record of the transaction the scan belongs to", HFILL } },
+        { &hf_ndb_batch_bytes,
+          { "Batch bytes", "ndb.scan.batch_bytes", FT_UINT32, BASE_DEC, NULL,
+            0x0, NULL, HFILL } },
+        { &hf_ndb_batch_rows,
+          { "First batch's rows", "ndb.scan.batch_rows", FT_UINT32, BASE_DEC,
+            NULL, 0x0, NULL, HFILL } },
+        { &hf_ndb_dist_key,
+          { "Distribution key", "ndb.scan.dist_key", FT_UINT32, BASE_HEX,
+            NULL, 0x0, NULL, HFILL } },
+        { &hf_ndb_receiver_id,
+          { "Receiver", "ndb.scan.receiver", FT_UINT32, BASE_HEX, NULL, 0x0,
+            "The client's id for one receiver of a scan's rows", HFILL } },
+        { &hf_ndb_receiver_coord,
+          { "Coordinator's pointer for the receiver", "ndb.scan.receiver_ptr",
+            FT_UINT32, BASE_CUSTOM, CF_FUNC(ndb_format_receiver_ptr), 0x0,
+            NULL, HFILL } },
+        { &hf_ndb_scan_conf_info,
+          { "Information", "ndb.scan.conf_info", FT_UINT32, BASE_HEX, NULL,
+            0x0, NULL, HFILL } },
+        { &hf_ndb_scan_conf_count,
+          { "Receivers reported", "ndb.scan.conf_info.count", FT_UINT32,
+            BASE_DEC, NULL, NDB_SCAN_CONF_COUNT, NULL, HFILL } },
+        { &hf_ndb_scan_conf_end,
+          { "End of data", "ndb.scan.conf_info.end", FT_BOOLEAN, 32, NULL,
+            1U << 31, NULL, HFILL } },
+        { &hf_ndb_receiver_info,
+          { "Batch", "ndb.scan.batch", FT_UINT32, BASE_HEX, NULL, 0x0, NULL,
+            HFILL } },
+        { &hf_ndb_receiver_len,
+          { "Words", "ndb.scan.batch.words", FT_UINT32, BASE_DEC, NULL,
+            0xFFFFFC00, "Row and key words in the batch", HFILL } },
+        { &hf_ndb_receiver_rows,
+          { "Rows", "ndb.scan.batch.rows", FT_UINT32, BASE_DEC, NULL,
+            NDB_RECEIVER_ROWS, "All ones: the next word holds the rows",
+            HFILL } },
+        { &hf_ndb_receiver_rows_word,
+          { "Rows", "ndb.scan.batch.rows_word", FT_UINT32, BASE_DEC, NULL,
+            0x0, NULL, HFILL } },
+        { &hf_ndb_receiver_len_word,
+          { "Words", "ndb.scan.batch.words_word", FT_UINT32, BASE_DEC, NULL,
+            0x0, "Row and key words in the batch", HFILL } },
+        { &hf_ndb_receiver_active,
+          { "Join's active mask", "ndb.scan.active_mask", FT_UINT32,
+            BASE_HEX, NULL, 0x0, "Meaningful for pushed-down joins only",
+            HFILL } },
+        { &hf_ndb_close_owed,
+          { "Close owed", "ndb.scan.close_owed", FT_UINT32, BASE_DEC, NULL,
+            0x0, "1: the client is to close the scan", HFILL } },
+        { &hf_ndb_stop,
+          { "Stop", "ndb.scan.stop", FT_UINT32, BASE_DEC, NULL, 0x0,
+            "Non-zero: close the scan", HFILL } },
+        { &hf_ndb_key_len,
+          { "Key length (words)", "ndb.scan.key_len", FT_UINT32, BASE_DEC,
+            NULL, 0x0, NULL, HFILL } },
+        { &hf_ndb_row_key_info,
+          { "Row", "ndb.scan.row_key", FT_UINT32, BASE_HEX, NULL, 0x0, NULL,
+            HFILL } },
+        { &hf_ndb_row_key_scan,
+          { "Scan number", "ndb.scan.row_key.scan", FT_UINT32, BASE_DEC,
+            NULL, 0x000000FF, NULL, HFILL } },
+        { &hf_ndb_row_key_op,
+          { "Operation number", "ndb.scan.row_key.op", FT_UINT32, BASE_DEC,
+            NULL, 0x0003FF00, NULL, HFILL } },
+        { &hf_ndb_row_key_frag,
+          { "Fragment", "ndb.scan.row_key.fragment", FT_UINT32, BASE_DEC,
+            NULL, 0xFFF00000, NULL, HFILL } },
+        { &hf_ndb_key,
+          { "Key", "ndb.scan.key", FT_BYTES, BASE_NONE, NULL, 0x0, NULL,
+            HFILL } },
+        { &hf_ndb_column_size_word,
+          { "Size", "ndb.scan.column_size", FT_UINT32, BASE_DEC, NULL, 0x0,
+            NULL, HFILL } },
+        { &hf_ndb_bound,
+          { "Bound word", "ndb.scan.bound", FT_UINT32, BASE_HEX, NULL, 0x0,
+            NULL, HFILL } },
+        { &hf_ndb_bound_type,
+          { "Type", "ndb.scan.bound.type", FT_UINT32, BASE_DEC,
+            VALS(ndb_bound_vals), 0x0000000F, NULL, HFILL } },
+        { &hf_ndb_bound_range,
+          { "Range number", "ndb.scan.bound.range", FT_UINT32, BASE_DEC, NULL,
+            0x0000FFF0, NULL, HFILL } },
+        { &hf_ndb_bound_len,
+          { "Range length (words)", "ndb.scan.bound.len", FT_UINT32, BASE_DEC,
+            NULL, 0xFFFF0000, NULL, HFILL } },
     };
 
     static int *ett[] = {
@@ -2822,6 +3481,15 @@ proto_register_ndb(void)
         &ett_ndb_list_flags,
         &ett_ndb_object,
         &ett_ndb_object_flags,
+        &ett_ndb_scan_flags,
+        &ett_ndb_scan_word5,
+        &ett_ndb_scan_conf_info,
+        &ett_ndb_receiver,
+        &ett_ndb_receiver_info,
+        &ett_ndb_row_key_info,
+        &ett_ndb_takeover_info,
+        &ett_ndb_bound,
+        &ett_ndb_bound_word,
     };
 
     static ei_register_info ei[] = {
