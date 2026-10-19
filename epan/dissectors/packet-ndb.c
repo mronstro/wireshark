@@ -75,6 +75,11 @@
  * bounds), SCAN_CONF with an entry per receiver, SCAN_REF, SCAN_MORE_REQ
  * and SCAN_ROW_KEY_REP. A scan's rows are ROW_DATA_REP, whose first word
  * then names a receiver rather than a query.
+ *
+ * Interpreted programs, a scan's and an interpreted KEY_OP_REQ's, are
+ * shown instruction by instruction with the names of our own the
+ * chapter (section 9) gives them; a column section then comes in five
+ * parts after five sizes.
  */
 
 #include "config.h"
@@ -135,6 +140,7 @@ static dissector_handle_t ndb_handle;
 /* KEY_OP_REQ's flags for its optional words. */
 #define NDB_FLAG_DIST_KEY         (1U << 2)
 #define NDB_FLAG_TAKEOVER         (1U << 14)
+#define NDB_FLAG_INTERPRETED      (1U << 15)
 #define NDB_FLAG_USER_ID          (1U << 29)
 
 /* A signal number whose layout here is not the one we decode. */
@@ -156,7 +162,58 @@ static dissector_handle_t ndb_handle;
 #define NDB_SCAN_CONF_COUNT       0x7FFFFFFF
 #define NDB_NULL_RECORD           0xFFFFFF00
 #define NDB_RECEIVER_ROWS         0x000003FF
-#define NDB_SCAN_SIZE_WORDS       5
+
+/* A column section in parts: reads, program, final updates, final
+ * reads, subroutines. */
+#define NDB_COLUMN_PARTS          5
+#define NDB_PART_PROGRAM          1
+#define NDB_PART_SUBROUTINES      4
+
+/*
+ * Instructions: the number is bits 0-5, plus 64 when bit 15 is set; the
+ * registers are in bits 6-8, 9-11, 12-14 and 16-18; bits 16-31 hold a
+ * jump's distance (bit 31 a jump back), a column id or a constant.
+ */
+#define NDB_INSN_NUMBER(word)     (((word) & 0x3F) | (((word) >> 9) & 0x40))
+#define NDB_INSN_R1(word)         (((word) >> 6) & 0x7)
+#define NDB_INSN_R2(word)         (((word) >> 9) & 0x7)
+#define NDB_INSN_R3(word)         (((word) >> 12) & 0x7)
+#define NDB_INSN_R4(word)         (((word) >> 16) & 0x7)
+#define NDB_INSN_FIELD(word)      ((word) >> 16)
+#define NDB_INSN_HIGH             64
+#define NDB_INSN_READ_COLUMN      1
+#define NDB_INSN_WRITE_COLUMN     2
+#define NDB_INSN_SET_NULL         3
+#define NDB_INSN_SET_16           4
+#define NDB_INSN_SET_32           5
+#define NDB_INSN_SET_64           6
+#define NDB_INSN_ADD              7
+#define NDB_INSN_SUBTRACT         8
+#define NDB_INSN_JUMP             9
+#define NDB_INSN_JUMP_IF_NULL     10
+#define NDB_INSN_JUMP_IF_VALUE    11
+#define NDB_INSN_JUMP_IF_EQ       12
+#define NDB_INSN_JUMP_IF_GE       17
+#define NDB_INSN_REFUSE           19
+#define NDB_INSN_TEST_VALUE       23
+#define NDB_INSN_COLUMN_NULL      24
+#define NDB_INSN_COLUMN_VALUE     25
+#define NDB_INSN_TEST_PARAM       26
+#define NDB_INSN_TEST_COLUMN      27
+#define NDB_INSN_SHIFT_LEFT       28
+#define NDB_INSN_REMAINDER        35
+#define NDB_INSN_BIT_NOT          36
+#define NDB_INSN_SET_DOUBLE       45
+#define NDB_INSN_COPY_TO_MEMORY   59
+#define NDB_INSN_ADD_IMM          71
+#define NDB_INSN_SUBTRACT_IMM     72
+#define NDB_INSN_JUMP_IF_EQ_IMM   76
+#define NDB_INSN_JUMP_IF_GE_IMM   81
+#define NDB_INSN_SHIFT_LEFT_IMM   92
+#define NDB_INSN_REMAINDER_IMM    99
+/* A column test's comparison, its NULL rule. */
+#define NDB_TEST_CMP(word)        (((word) >> 12) & 0xF)
+#define NDB_TEST_NULLS(word)      (((word) >> 6) & 0x3)
 
 /* A data node's state, in HEARTBEAT_CONF: 16 words, the last 8 a bitmap. */
 #define NDB_NODE_STATE_WORDS      16
@@ -358,6 +415,121 @@ static const value_string ndb_bound_vals[] = {
     { 0, NULL }
 };
 
+static const value_string ndb_insn_vals[] = {
+    { 1, "READ_COLUMN" },
+    { 2, "WRITE_COLUMN" },
+    { 3, "SET_NULL" },
+    { 4, "SET_16" },
+    { 5, "SET_32" },
+    { 6, "SET_64" },
+    { 7, "ADD" },
+    { 8, "SUBTRACT" },
+    { 9, "JUMP" },
+    { 10, "JUMP_IF_NULL" },
+    { 11, "JUMP_IF_VALUE" },
+    { 12, "JUMP_IF_EQ" },
+    { 13, "JUMP_IF_NE" },
+    { 14, "JUMP_IF_LT" },
+    { 15, "JUMP_IF_LE" },
+    { 16, "JUMP_IF_GT" },
+    { 17, "JUMP_IF_GE" },
+    { 18, "ACCEPT" },
+    { 19, "REFUSE" },
+    { 20, "CALL" },
+    { 21, "RETURN" },
+    { 22, "ACCEPT_LAST" },
+    { 23, "TEST_COLUMN_VALUE" },
+    { 24, "JUMP_IF_COLUMN_NULL" },
+    { 25, "JUMP_IF_COLUMN_VALUE" },
+    { 26, "TEST_COLUMN_PARAM" },
+    { 27, "TEST_COLUMN_COLUMN" },
+    { 28, "SHIFT_LEFT" },
+    { 29, "SHIFT_RIGHT" },
+    { 30, "MULTIPLY" },
+    { 31, "DIVIDE" },
+    { 32, "BIT_AND" },
+    { 33, "BIT_OR" },
+    { 34, "BIT_XOR" },
+    { 35, "REMAINDER" },
+    { 36, "BIT_NOT" },
+    { 45, "SET_DOUBLE" },
+    { 48, "READ_COLUMN_TO_MEMORY" },
+    { 49, "LOAD_8" },
+    { 50, "LOAD_16" },
+    { 51, "LOAD_32" },
+    { 52, "LOAD_64" },
+    { 53, "STORE_8" },
+    { 54, "STORE_16" },
+    { 55, "STORE_32" },
+    { 56, "STORE_64" },
+    { 57, "WRITE_COLUMN_FROM_MEMORY" },
+    { 58, "APPEND_COLUMN_FROM_MEMORY" },
+    { 59, "COPY_TO_MEMORY" },
+    { 62, "STORE_REGISTER" },
+    { 71, "ADD_IMM" },
+    { 72, "SUBTRACT_IMM" },
+    { 76, "JUMP_IF_EQ_IMM" },
+    { 77, "JUMP_IF_NE_IMM" },
+    { 78, "JUMP_IF_LT_IMM" },
+    { 79, "JUMP_IF_LE_IMM" },
+    { 80, "JUMP_IF_GT_IMM" },
+    { 81, "JUMP_IF_GE_IMM" },
+    { 92, "SHIFT_LEFT_IMM" },
+    { 93, "SHIFT_RIGHT_IMM" },
+    { 94, "MULTIPLY_IMM" },
+    { 95, "DIVIDE_IMM" },
+    { 96, "BIT_AND_IMM" },
+    { 97, "BIT_OR_IMM" },
+    { 98, "BIT_XOR_IMM" },
+    { 99, "REMAINDER_IMM" },
+    { 113, "LOAD_8_AT" },
+    { 114, "LOAD_16_AT" },
+    { 115, "LOAD_32_AT" },
+    { 116, "LOAD_64_AT" },
+    { 117, "STORE_8_AT" },
+    { 118, "STORE_16_AT" },
+    { 119, "STORE_32_AT" },
+    { 120, "STORE_64_AT" },
+    { 121, "READ_INPUT" },
+    { 123, "WRITE_OUTPUT" },
+    { 125, "ZERO_MEMORY" },
+    { 0, NULL }
+};
+
+/* A column test's comparison; the value stands first: "value < column". */
+static const value_string ndb_test_cmp_vals[] = {
+    { 0, "=" },
+    { 1, "<>" },
+    { 2, "<" },
+    { 3, "<=" },
+    { 4, ">" },
+    { 5, ">=" },
+    { 6, "LIKE" },
+    { 7, "NOT LIKE" },
+    { 8, "mask test 8" },
+    { 9, "mask test 9" },
+    { 10, "mask test 10" },
+    { 11, "mask test 11" },
+    { 0, NULL }
+};
+
+static const value_string ndb_null_rule_vals[] = {
+    { 0, "compare: NULL equals NULL, below any value" },
+    { 2, "jump if either is NULL" },
+    { 3, "go on if either is NULL" },
+    { 0, NULL }
+};
+
+/* The comparisons of the register jumps, in their order. */
+static const char * const ndb_reg_cmp[] = {
+    "=", "<>", "<", "<=", ">", ">="
+};
+
+/* The operators of 28-35 and 92-99, in their order. */
+static const char * const ndb_reg_ops[] = {
+    "<<", ">>", "*", "/", "&", "|", "^", "%"
+};
+
 static const value_string ndb_abort_vals[] = {
     { 0, "abort on error" },
     { 2, "ignore error" },
@@ -504,6 +676,7 @@ static int hf_ndb_object_store;
 static int hf_ndb_object_temporary;
 static int hf_ndb_flag_dist_key;
 static int hf_ndb_flag_takeover;
+static int hf_ndb_flag_interpreted;
 static int hf_ndb_flag_user_id;
 static int hf_ndb_user_id;
 static int hf_ndb_user_id_version;
@@ -560,6 +733,18 @@ static int hf_ndb_row_key_op;
 static int hf_ndb_row_key_frag;
 static int hf_ndb_key;
 static int hf_ndb_column_size_word;
+static int hf_ndb_insn;
+static int hf_ndb_insn_op;
+static int hf_ndb_insn_column;
+static int hf_ndb_insn_cmp;
+static int hf_ndb_insn_null_rule;
+static int hf_ndb_insn_target;
+static int hf_ndb_insn_code;
+static int hf_ndb_insn_len;
+static int hf_ndb_insn_param;
+static int hf_ndb_insn_value;
+static int hf_ndb_insn_const;
+static int hf_ndb_insn_double;
 static int hf_ndb_bound;
 static int hf_ndb_bound_type;
 static int hf_ndb_bound_range;
@@ -661,6 +846,8 @@ static int ett_ndb_receiver_info;
 static int ett_ndb_row_key_info;
 static int ett_ndb_takeover_info;
 static int ett_ndb_bound;
+static int ett_ndb_column_part;
+static int ett_ndb_insn;
 static int ett_ndb_bound_word;
 
 static expert_field ei_ndb_bad_message;
@@ -714,6 +901,7 @@ static int * const ndb_flags_fields[] = {
     &hf_ndb_flag_start,
     &hf_ndb_flag_abort,
     &hf_ndb_flag_takeover,
+    &hf_ndb_flag_interpreted,
     &hf_ndb_flag_user_id,
     &hf_ndb_flag_committed_base,
     &hf_ndb_flag_no_wait,
@@ -1392,37 +1580,385 @@ ndb_scan_entries(ndb_words_t *w, unsigned count)
     ndb_rest(w);
 }
 
+/* A jump's target, as a word of the program. */
+static unsigned
+ndb_insn_target(uint32_t word, unsigned here)
+{
+    unsigned distance = (word >> 16) & 0x7FFF;
+
+    return (word & 0x80000000U) ? here - distance : here + distance;
+}
+
+/* The instruction a word starts: a column test with a comparison of 8
+ * or more has bit 15 set, and is still the test. */
+static unsigned
+ndb_insn_base(uint32_t word)
+{
+    unsigned n = NDB_INSN_NUMBER(word);
+
+    if (n == NDB_INSN_TEST_VALUE + NDB_INSN_HIGH ||
+        n == NDB_INSN_TEST_PARAM + NDB_INSN_HIGH ||
+        n == NDB_INSN_TEST_COLUMN + NDB_INSN_HIGH)
+        return n - NDB_INSN_HIGH;
+    return n;
+}
+
+/* What a column test does with NULL, as words after its comparison. */
+static const char *
+ndb_null_phrase(uint32_t word)
+{
+    switch (NDB_TEST_NULLS(word)) {
+    case 0:
+        return "";
+    case 2:
+        return ", or if either is NULL";
+    case 3:
+        return ", not if either is NULL";
+    default:
+        return ", NULL rule 1";
+    }
+}
+
 /*
- * SCAN_REQ's column section: five size words, then the columns to read,
- * as many words as the first size says; what follows is shown as words.
+ * A test's value for the summary: as text when its bytes are text, after
+ * a length byte or two that counts them, or of two bytes or more without
+ * one; else as a number when it is 1, 2, 4 or 8 bytes; else as bytes. A
+ * value of one byte is a number, so an empty VARCHAR shows as 0.
  */
 static void
-ndb_scan_columns(ndb_words_t *w)
+ndb_value_text(char *buf, size_t size, tvbuff_t *tvb, unsigned at,
+               unsigned len, unsigned encoding)
 {
-    uint32_t first = 0;
+    unsigned skip = 0;
     unsigned i;
-    ndb_words_t list;
-    unsigned used;
+    unsigned n;
+    bool text = true;
 
-    for (i = 0; i < NDB_SCAN_SIZE_WORDS && w->left > 0; i++) {
+    if (len == 0) {
+        snprintf(buf, size, "NULL");
+        return;
+    }
+    if (len >= 2 && tvb_get_uint8(tvb, at) == len - 1)
+        skip = 1;
+    else if (len >= 3 && tvb_get_letohs(tvb, at) == len - 2)
+        skip = 2;
+    for (i = skip; i < len && text; i++) {
+        uint8_t b = tvb_get_uint8(tvb, at + i);
+        text = b >= 0x20 && b < 0x7F;
+    }
+    if (text && len >= 2) {
+        n = 0;
+        buf[n++] = '\'';
+        for (i = skip; i < len && n + 2 < size; i++)
+            buf[n++] = (char)tvb_get_uint8(tvb, at + i);
+        buf[n++] = '\'';
+        buf[n] = '\0';
+        return;
+    }
+    switch (len) {
+    case 1:
+        snprintf(buf, size, "%d", (int8_t)tvb_get_uint8(tvb, at));
+        return;
+    case 2:
+        snprintf(buf, size, "%d", (int16_t)tvb_get_uint16(tvb, at, encoding));
+        return;
+    case 4:
+        snprintf(buf, size, "%d", (int32_t)tvb_get_uint32(tvb, at, encoding));
+        return;
+    case 8: {
+        uint64_t v = tvb_get_uint64(tvb, at, encoding);
+
+        if ((int64_t)v < 0)
+            snprintf(buf, size, "%" PRId64 " (unsigned %" PRIu64 ")",
+                     (int64_t)v, v);
+        else
+            snprintf(buf, size, "%" PRIu64, v);
+        return;
+    }
+    default:
+        snprintf(buf, size, "%u bytes", len);
+        return;
+    }
+}
+
+/*
+ * An interpreted program, an instruction at a time, each with the
+ * number of its first word in the program, which a jump's target names.
+ */
+static void
+ndb_program(ndb_words_t *w)
+{
+    unsigned start = w->offset;
+
+    while (w->left > 0) {
         unsigned at = w->offset;
-        proto_item *ti;
-        uint32_t value = tvb_get_uint32(w->tvb, at, w->encoding);
+        unsigned here = (at - start) / 4;
+        uint32_t word = tvb_get_uint32(w->tvb, at, w->encoding);
+        uint32_t second = 0;
+        uint32_t field = NDB_INSN_FIELD(word);
+        unsigned n = ndb_insn_base(word);
+        unsigned target = ndb_insn_target(word, here);
+        unsigned words = 1;
+        unsigned len = 0;
+        char detail[128];
+        char value[64];
+        proto_tree *it;
+        proto_item *ii;
 
-        if (i == 0)
-            first = value;
+        if (w->left > 1)
+            second = tvb_get_uint32(w->tvb, at + 4, w->encoding);
+        switch (n) {
+        case NDB_INSN_SET_32:
+            words = 2;
+            break;
+        case NDB_INSN_SET_64:
+        case NDB_INSN_SET_DOUBLE:
+            words = 3;
+            break;
+        case NDB_INSN_TEST_VALUE:
+            len = second & 0xFFFF;
+            words = 2 + (len + 3) / 4;
+            break;
+        case NDB_INSN_COLUMN_NULL:
+        case NDB_INSN_COLUMN_VALUE:
+        case NDB_INSN_TEST_PARAM:
+        case NDB_INSN_TEST_COLUMN:
+            words = 2;
+            break;
+        case NDB_INSN_COPY_TO_MEMORY:
+            words = 1 + (field + 3) / 4;
+            break;
+        default:
+            break;
+        }
+        if (words > w->left)
+            words = w->left;
+        if (n == NDB_INSN_TEST_VALUE) {
+            unsigned room = words >= 2 ? 4 * (words - 2) : 0;
+
+            if (len > room)
+                len = room;
+        }
+        it = proto_tree_add_subtree(w->tree, w->tvb, at, 4 * words,
+                                    ett_ndb_insn, &ii, "Instruction");
+        proto_tree_add_item(it, hf_ndb_insn, w->tvb, at, 4, w->encoding);
+        proto_tree_add_uint(it, hf_ndb_insn_op, w->tvb, at, 4, n);
+        detail[0] = '\0';
+        value[0] = '\0';
+        switch (n) {
+        case NDB_INSN_READ_COLUMN:
+            proto_tree_add_uint(it, hf_ndb_insn_column, w->tvb, at, 4, field);
+            snprintf(detail, sizeof detail, "r%u = column %u",
+                     NDB_INSN_R1(word), field);
+            break;
+        case NDB_INSN_WRITE_COLUMN:
+            proto_tree_add_uint(it, hf_ndb_insn_column, w->tvb, at, 4, field);
+            snprintf(detail, sizeof detail, "column %u = r%u", field,
+                     NDB_INSN_R1(word));
+            break;
+        case NDB_INSN_SET_NULL:
+            snprintf(detail, sizeof detail, "r%u = NULL", NDB_INSN_R1(word));
+            break;
+        case NDB_INSN_SET_16:
+            proto_tree_add_uint64(it, hf_ndb_insn_const, w->tvb, at, 4, field);
+            snprintf(detail, sizeof detail, "r%u = %u", NDB_INSN_R1(word),
+                     field);
+            break;
+        case NDB_INSN_SET_32:
+            if (words == 2)
+                proto_tree_add_uint64(it, hf_ndb_insn_const, w->tvb, at + 4,
+                                      4, second);
+            snprintf(detail, sizeof detail, "r%u = %u", NDB_INSN_R1(word),
+                     second);
+            break;
+        case NDB_INSN_SET_64:
+            if (words == 3) {
+                uint64_t v = tvb_get_uint64(w->tvb, at + 4, w->encoding);
+
+                proto_tree_add_uint64(it, hf_ndb_insn_const, w->tvb, at + 4,
+                                      8, v);
+                snprintf(detail, sizeof detail, "r%u = %" PRIu64,
+                         NDB_INSN_R1(word), v);
+            }
+            break;
+        case NDB_INSN_SET_DOUBLE:
+            if (words == 3) {
+                double v = tvb_get_ieee_double(w->tvb, at + 4, w->encoding);
+
+                proto_tree_add_double(it, hf_ndb_insn_double, w->tvb, at + 4,
+                                      8, v);
+                snprintf(detail, sizeof detail, "r%u = %g",
+                         NDB_INSN_R1(word), v);
+            }
+            break;
+        case NDB_INSN_ADD:
+        case NDB_INSN_SUBTRACT:
+            snprintf(detail, sizeof detail, "r%u = r%u %c r%u",
+                     NDB_INSN_R4(word), NDB_INSN_R1(word),
+                     n == NDB_INSN_ADD ? '+' : '-', NDB_INSN_R2(word));
+            break;
+        case NDB_INSN_JUMP:
+            proto_tree_add_uint(it, hf_ndb_insn_target, w->tvb, at, 4, target);
+            snprintf(detail, sizeof detail, "to %u", target);
+            break;
+        case NDB_INSN_JUMP_IF_NULL:
+        case NDB_INSN_JUMP_IF_VALUE:
+            proto_tree_add_uint(it, hf_ndb_insn_target, w->tvb, at, 4, target);
+            snprintf(detail, sizeof detail, "to %u if r%u is %sNULL", target,
+                     NDB_INSN_R1(word),
+                     n == NDB_INSN_JUMP_IF_NULL ? "" : "not ");
+            break;
+        case NDB_INSN_REFUSE:
+            proto_tree_add_uint(it, hf_ndb_insn_code, w->tvb, at, 4, field);
+            snprintf(detail, sizeof detail, "error %u", field);
+            break;
+        case NDB_INSN_TEST_VALUE:
+        case NDB_INSN_TEST_PARAM:
+        case NDB_INSN_TEST_COLUMN:
+            proto_tree_add_uint(it, hf_ndb_insn_cmp, w->tvb, at, 4,
+                                NDB_TEST_CMP(word));
+            proto_tree_add_uint(it, hf_ndb_insn_null_rule, w->tvb, at, 4,
+                                NDB_TEST_NULLS(word));
+            proto_tree_add_uint(it, hf_ndb_insn_target, w->tvb, at, 4, target);
+            if (words < 2)
+                break;
+            proto_tree_add_uint(it, hf_ndb_insn_column, w->tvb, at + 4, 4,
+                                second >> 16);
+            if (n == NDB_INSN_TEST_VALUE) {
+                proto_tree_add_uint(it, hf_ndb_insn_len, w->tvb, at + 4, 4,
+                                    len);
+                if (len > 0)
+                    proto_tree_add_item(it, hf_ndb_insn_value, w->tvb, at + 8,
+                                        len, ENC_NA);
+                ndb_value_text(value, sizeof value, w->tvb, at + 8, len,
+                               w->encoding);
+            } else if (n == NDB_INSN_TEST_PARAM) {
+                proto_tree_add_uint(it, hf_ndb_insn_param, w->tvb, at + 4, 4,
+                                    second & 0xFFFF);
+                snprintf(value, sizeof value, "parameter %u", second & 0xFFFF);
+            } else {
+                proto_tree_add_uint(it, hf_ndb_insn_column, w->tvb, at + 4, 4,
+                                    second & 0xFFFF);
+                snprintf(value, sizeof value, "column %u", second & 0xFFFF);
+            }
+            snprintf(detail, sizeof detail, "to %u if %s %s column %u%s",
+                     target, value,
+                     val_to_str_const(NDB_TEST_CMP(word), ndb_test_cmp_vals,
+                                      "?"),
+                     second >> 16, ndb_null_phrase(word));
+            break;
+        case NDB_INSN_COLUMN_NULL:
+        case NDB_INSN_COLUMN_VALUE:
+            proto_tree_add_uint(it, hf_ndb_insn_target, w->tvb, at, 4, target);
+            if (words < 2)
+                break;
+            proto_tree_add_uint(it, hf_ndb_insn_column, w->tvb, at + 4, 4,
+                                second >> 16);
+            snprintf(detail, sizeof detail, "to %u if column %u is %sNULL",
+                     target, second >> 16,
+                     n == NDB_INSN_COLUMN_NULL ? "" : "not ");
+            break;
+        case NDB_INSN_BIT_NOT:
+            snprintf(detail, sizeof detail, "r%u = ~r%u", NDB_INSN_R3(word),
+                     NDB_INSN_R1(word));
+            break;
+        case NDB_INSN_ADD_IMM:
+        case NDB_INSN_SUBTRACT_IMM:
+            proto_tree_add_uint64(it, hf_ndb_insn_const, w->tvb, at, 4, field);
+            snprintf(detail, sizeof detail, "r%u = r%u %c %u",
+                     NDB_INSN_R3(word), NDB_INSN_R1(word),
+                     n == NDB_INSN_ADD_IMM ? '+' : '-', field);
+            break;
+        case NDB_INSN_COPY_TO_MEMORY:
+            if (words > 1)
+                proto_tree_add_item(it, hf_ndb_insn_value, w->tvb, at + 4,
+                                    4 * (words - 1), ENC_NA);
+            break;
+        default:
+            if (n >= NDB_INSN_JUMP_IF_EQ && n <= NDB_INSN_JUMP_IF_GE) {
+                proto_tree_add_uint(it, hf_ndb_insn_target, w->tvb, at, 4,
+                                    target);
+                snprintf(detail, sizeof detail, "to %u if r%u %s r%u", target,
+                         NDB_INSN_R1(word),
+                         ndb_reg_cmp[n - NDB_INSN_JUMP_IF_EQ],
+                         NDB_INSN_R2(word));
+            } else if (n >= NDB_INSN_JUMP_IF_EQ_IMM &&
+                       n <= NDB_INSN_JUMP_IF_GE_IMM) {
+                proto_tree_add_uint(it, hf_ndb_insn_target, w->tvb, at, 4,
+                                    target);
+                snprintf(detail, sizeof detail, "to %u if r%u %s %u", target,
+                         NDB_INSN_R1(word),
+                         ndb_reg_cmp[n - NDB_INSN_JUMP_IF_EQ_IMM],
+                         (word >> 9) & 0x3F);
+            } else if (n >= NDB_INSN_SHIFT_LEFT && n <= NDB_INSN_REMAINDER) {
+                snprintf(detail, sizeof detail, "r%u = r%u %s r%u",
+                         NDB_INSN_R3(word), NDB_INSN_R1(word),
+                         ndb_reg_ops[n - NDB_INSN_SHIFT_LEFT],
+                         NDB_INSN_R2(word));
+            } else if (n >= NDB_INSN_SHIFT_LEFT_IMM &&
+                       n <= NDB_INSN_REMAINDER_IMM) {
+                proto_tree_add_uint64(it, hf_ndb_insn_const, w->tvb, at, 4,
+                                      field);
+                snprintf(detail, sizeof detail, "r%u = r%u %s %u",
+                         NDB_INSN_R3(word), NDB_INSN_R1(word),
+                         ndb_reg_ops[n - NDB_INSN_SHIFT_LEFT_IMM], field);
+            }
+            break;
+        }
+        proto_item_set_text(ii, "%u: %s%s%s", here,
+                            val_to_str_const(n, ndb_insn_vals,
+                                             "instruction not described"),
+                            detail[0] != '\0' ? " " : "", detail);
+        w->offset += 4 * words;
+        w->left -= words;
+    }
+}
+
+/*
+ * A column section in parts, as SCAN_REQ and an interpreted KEY_OP_REQ
+ * send it: five sizes, then the reads before the program, the program,
+ * the final updates, the final reads and the subroutines.
+ */
+static const char * const ndb_column_part_names[NDB_COLUMN_PARTS] = {
+    "Reads before the program", "Program", "Final updates", "Final reads",
+    "Subroutines"
+};
+
+static void
+ndb_column_parts(ndb_words_t *w)
+{
+    uint32_t part_words[NDB_COLUMN_PARTS] = { 0 };
+    unsigned i;
+
+    for (i = 0; i < NDB_COLUMN_PARTS && w->left > 0; i++) {
+        proto_item *ti;
+
+        part_words[i] = tvb_get_uint32(w->tvb, w->offset, w->encoding);
         ti = proto_tree_add_item(w->tree, hf_ndb_column_size_word, w->tvb,
-                                 at, 4, w->encoding);
-        proto_item_append_text(ti, " (size word %u)", i + 1);
+                                 w->offset, 4, w->encoding);
+        proto_item_append_text(ti, " (%s)", ndb_column_part_names[i]);
         w->offset += 4;
         w->left--;
     }
-    list = *w;
-    used = first < w->left ? first : w->left;
-    list.left = used;
-    ndb_columns(&list, false);
-    w->offset += 4 * used;
-    w->left -= used;
+    for (i = 0; i < NDB_COLUMN_PARTS && w->left > 0; i++) {
+        ndb_words_t part = *w;
+        unsigned used = part_words[i] < w->left ? part_words[i] : w->left;
+
+        if (used == 0)
+            continue;
+        part.left = used;
+        part.tree = proto_tree_add_subtree_format(w->tree, w->tvb, w->offset,
+                4 * used, ett_ndb_column_part, NULL, "%s, %u words",
+                ndb_column_part_names[i], used);
+        if (i == NDB_PART_PROGRAM)
+            ndb_program(&part);
+        else if (i == NDB_PART_SUBROUTINES)
+            ndb_rest(&part);
+        else
+            ndb_columns(&part, false);
+        w->offset += 4 * used;
+        w->left -= used;
+    }
     ndb_rest(w);
 }
 
@@ -2312,8 +2848,14 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
             } else if (fragment == 0) {
                 if ((signal == NDB_SIG_KEY_OP_REQ ||
                      signal == NDB_SIG_UNIQUE_OP_REQ) && number == 1) {
+                    uint32_t op_flags = data_words > 4 ?
+                        tvb_get_uint32(tvb, data_at + 16, encoding) : 0;
+
                     sw.tree = proto_item_add_subtree(ti, ett_ndb_row);
-                    ndb_columns(&sw, false);
+                    if (op_flags & NDB_FLAG_INTERPRETED)
+                        ndb_column_parts(&sw);
+                    else
+                        ndb_columns(&sw, false);
                 } else if (signal == NDB_SIG_ROW_DATA_REP && number == 0) {
                     sw.tree = proto_item_add_subtree(ti, ett_ndb_row);
                     ndb_columns(&sw, true);
@@ -2323,7 +2865,7 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
                         ndb_word(&sw, hf_ndb_receiver_id);
                 } else if (signal == NDB_SIG_SCAN_REQ && number == 1) {
                     sw.tree = proto_item_add_subtree(ti, ett_ndb_row);
-                    ndb_scan_columns(&sw);
+                    ndb_column_parts(&sw);
                 } else if (signal == NDB_SIG_SCAN_REQ && number == 2) {
                     sw.tree = proto_item_add_subtree(ti, ett_ndb_bound);
                     ndb_bounds(&sw);
@@ -3261,6 +3803,11 @@ proto_register_ndb(void)
         { &hf_ndb_flag_takeover,
           { "Scan takeover", "ndb.flags.takeover", FT_BOOLEAN, 32, NULL,
             1U << 14, "Takes over the lock a scan holds on the row", HFILL } },
+        { &hf_ndb_flag_interpreted,
+          { "Interpreted", "ndb.flags.interpreted", FT_BOOLEAN, 32, NULL,
+            1U << 15,
+            "The column section holds a program, in five parts after five "
+            "sizes", HFILL } },
         { &hf_ndb_flag_user_id,
           { "User id given", "ndb.flags.user_id", FT_BOOLEAN, 32, NULL,
             1U << 29, "For the data nodes' rate limits", HFILL } },
@@ -3434,8 +3981,49 @@ proto_register_ndb(void)
           { "Key", "ndb.scan.key", FT_BYTES, BASE_NONE, NULL, 0x0, NULL,
             HFILL } },
         { &hf_ndb_column_size_word,
-          { "Size", "ndb.scan.column_size", FT_UINT32, BASE_DEC, NULL, 0x0,
+          { "Part size (words)", "ndb.column_part_size", FT_UINT32, BASE_DEC,
+            NULL, 0x0, NULL, HFILL } },
+        { &hf_ndb_insn,
+          { "Instruction word", "ndb.insn", FT_UINT32, BASE_HEX, NULL, 0x0,
             NULL, HFILL } },
+        { &hf_ndb_insn_op,
+          { "Instruction", "ndb.insn.op", FT_UINT32, BASE_DEC,
+            VALS(ndb_insn_vals), 0x0,
+            "Bits 0-5, plus 64 when bit 15 is set", HFILL } },
+        { &hf_ndb_insn_column,
+          { "Column", "ndb.insn.column", FT_UINT32, BASE_DEC, NULL, 0x0,
+            NULL, HFILL } },
+        { &hf_ndb_insn_cmp,
+          { "Comparison", "ndb.insn.cmp", FT_UINT32, BASE_DEC,
+            VALS(ndb_test_cmp_vals), 0x0,
+            "Bits 12-15; the value stands first, as in value < column",
+            HFILL } },
+        { &hf_ndb_insn_null_rule,
+          { "NULL rule", "ndb.insn.null_rule", FT_UINT32, BASE_DEC,
+            VALS(ndb_null_rule_vals), 0x0, "Bits 6-7", HFILL } },
+        { &hf_ndb_insn_target,
+          { "Jumps to word", "ndb.insn.target", FT_UINT32, BASE_DEC, NULL,
+            0x0, "Of the program; the distance is counted from the jump",
+            HFILL } },
+        { &hf_ndb_insn_code,
+          { "Error code", "ndb.insn.code", FT_UINT32, BASE_DEC, NULL, 0x0,
+            NULL, HFILL } },
+        { &hf_ndb_insn_len,
+          { "Value length (bytes)", "ndb.insn.len", FT_UINT32, BASE_DEC, NULL,
+            0x0, NULL, HFILL } },
+        { &hf_ndb_insn_param,
+          { "Parameter", "ndb.insn.param", FT_UINT32, BASE_DEC, NULL, 0x0,
+            NULL, HFILL } },
+        { &hf_ndb_insn_value,
+          { "Value", "ndb.insn.value", FT_BYTES, BASE_NONE, NULL, 0x0, NULL,
+            HFILL } },
+        { &hf_ndb_insn_const,
+          { "Constant", "ndb.insn.const", FT_UINT64, BASE_DEC, NULL, 0x0,
+            NULL, HFILL } },
+        { &hf_ndb_insn_double,
+          { "Constant", "ndb.insn.double", FT_DOUBLE, BASE_NONE, NULL, 0x0,
+            NULL, HFILL } },
+
         { &hf_ndb_bound,
           { "Bound word", "ndb.scan.bound", FT_UINT32, BASE_HEX, NULL, 0x0,
             NULL, HFILL } },
@@ -3490,6 +4078,8 @@ proto_register_ndb(void)
         &ett_ndb_takeover_info,
         &ett_ndb_bound,
         &ett_ndb_bound_word,
+        &ett_ndb_column_part,
+        &ett_ndb_insn,
     };
 
     static ei_register_info ei[] = {
