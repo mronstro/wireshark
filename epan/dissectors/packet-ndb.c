@@ -80,6 +80,18 @@
  * shown instruction by instruction with the names of our own the
  * chapter (section 9) gives them; a column section then comes in five
  * parts after five sizes.
+ *
+ * Blob columns (the chapter's section 6.10) need no signals of their
+ * own: a blob's parts are rows of another table, read and written with
+ * KEY_OP_REQ like any. What is shown for them is the lock reference, a
+ * column id that is no column, whose three words say where a locked row
+ * is and which operation locked it, and the unlock, KEY_OP_REQ's
+ * operation type 7, whose distribution key word and key are that lock
+ * reference. A read that names columns one by one after its bitmap, as
+ * a blob column's head and the lock reference are read, gets them back
+ * after its packed values, and the packed values have no length of
+ * their own: the dissector keeps what each read named, by transaction
+ * and query, and takes those columns off the reply's end to find them.
  */
 
 #include "config.h"
@@ -154,6 +166,25 @@ static dissector_handle_t ndb_handle;
 #define NDB_COL_READ_EVERY        0xFFF0
 #define NDB_COL_READ_MASKED       0xFFF3
 #define NDB_COL_PARTITION         0xFFFE
+#define NDB_COL_ROW_COUNT         0xFFFD
+#define NDB_COL_RANGE_NUMBER      0xFFFB
+#define NDB_COL_LOCK_REF          0xFFEE
+#define NDB_COL_OP_IDENTITY       0xFFED
+#define NDB_COL_ROW_CHECKPOINT    0xFFE7
+
+/*
+ * A lock reference is three words: the data node and the fragment, the
+ * coordinator's index for the locking operation, and the data node's own
+ * number for it. An unlock is KEY_OP_REQ's operation type 7, whose
+ * distribution key word is the first of them and whose key the other two.
+ */
+#define NDB_LOCK_REF_WORDS        3
+#define NDB_OP_TYPE_SHIFT         5
+#define NDB_OP_TYPE_MASK          7U
+#define NDB_OP_UNLOCK             7
+
+/* The columns a read names after "columns by bitmap", kept per query. */
+#define NDB_MAX_AFTER             16
 
 /* Scans: SCAN_REQ's distribution key flag, SCAN_CONF's receiver count,
  * the coordinator's pointer for a receiver that is done, and the row
@@ -403,6 +434,8 @@ static const value_string ndb_operation_vals[] = {
     { 3, "delete" },
     { 4, "write" },
     { 5, "read exclusive" },
+    { 6, "refresh" },
+    { 7, "unlock" },
     { 0, NULL }
 };
 
@@ -761,6 +794,11 @@ static int hf_ndb_column_size;
 static int hf_ndb_column_value;
 static int hf_ndb_column_bitmap;
 static int hf_ndb_packed_values;
+static int hf_ndb_lock_place;
+static int hf_ndb_lock_node;
+static int hf_ndb_lock_fragment;
+static int hf_ndb_lock_op_index;
+static int hf_ndb_lock_op_number;
 static int hf_ndb_coll_kind;
 static int hf_ndb_coll_number;
 static int hf_ndb_coll_name_len;
@@ -835,6 +873,7 @@ static int ett_ndb_connected;
 static int ett_ndb_row;
 static int ett_ndb_column;
 static int ett_ndb_column_header;
+static int ett_ndb_lock_ref;
 static int ett_ndb_list_flags;
 static int ett_ndb_object;
 static int ett_ndb_object_flags;
@@ -1018,6 +1057,12 @@ static int * const ndb_column_header_fields[] = {
     NULL
 };
 
+static int * const ndb_lock_place_fields[] = {
+    &hf_ndb_lock_node,
+    &hf_ndb_lock_fragment,
+    NULL
+};
+
 static int * const ndb_list_flags_fields[] = {
     &hf_ndb_list_names,
     &hf_ndb_list_dependent,
@@ -1164,6 +1209,26 @@ ndb_format_step(char *buf, uint32_t value)
 }
 
 /* A column id, or what an id that is not a column asks for. */
+/* The name of a column id that is not a column, or NULL. */
+static const char *
+ndb_pseudo_column_name(uint32_t id)
+{
+    switch (id) {
+    case NDB_COL_ROW_COUNT:
+        return "row count";
+    case NDB_COL_RANGE_NUMBER:
+        return "range number";
+    case NDB_COL_LOCK_REF:
+        return "lock reference";
+    case NDB_COL_OP_IDENTITY:
+        return "operation's identity";
+    case NDB_COL_ROW_CHECKPOINT:
+        return "row's global checkpoint";
+    default:
+        return NULL;
+    }
+}
+
 static void
 ndb_format_column_id(char *buf, uint32_t value)
 {
@@ -1176,6 +1241,14 @@ ndb_format_column_id(char *buf, uint32_t value)
         break;
     case NDB_COL_PARTITION:
         snprintf(buf, ITEM_LABEL_LENGTH, "partition (0x%04x)", value);
+        break;
+    case NDB_COL_ROW_COUNT:
+    case NDB_COL_RANGE_NUMBER:
+    case NDB_COL_LOCK_REF:
+    case NDB_COL_OP_IDENTITY:
+    case NDB_COL_ROW_CHECKPOINT:
+        snprintf(buf, ITEM_LABEL_LENGTH, "%s (0x%04x)",
+                 ndb_pseudo_column_name(value), value);
         break;
     default:
         snprintf(buf, ITEM_LABEL_LENGTH, "%u", value);
@@ -1380,22 +1453,138 @@ ndb_node_state(ndb_words_t *w)
 }
 
 /*
+ * What a read named after "columns by bitmap": columns read one by one
+ * beside the packed values, such as a blob column's head or a lock
+ * reference. Kept from the request, by transaction and query, so that
+ * the reply's packed values can be told from them.
+ */
+typedef struct {
+    uint32_t trans_lo;
+    uint32_t trans_hi;
+    uint32_t query;
+} ndb_query_key_t;
+
+typedef struct {
+    unsigned count;
+    uint16_t ids[NDB_MAX_AFTER];
+} ndb_after_t;
+
+static wmem_map_t *ndb_queries;
+
+static unsigned
+ndb_query_key_hash(const void *k)
+{
+    const ndb_query_key_t *q = (const ndb_query_key_t *)k;
+
+    return q->trans_lo ^ (q->trans_hi * 2654435761U) ^ (q->query * 40503U);
+}
+
+static gboolean
+ndb_query_key_equal(const void *a, const void *b)
+{
+    const ndb_query_key_t *x = (const ndb_query_key_t *)a;
+    const ndb_query_key_t *y = (const ndb_query_key_t *)b;
+
+    return x->trans_lo == y->trans_lo && x->trans_hi == y->trans_hi &&
+           x->query == y->query;
+}
+
+/* What a query named after its bitmap, if its request was seen. */
+static ndb_after_t *
+ndb_after_lookup(tvbuff_t *tvb, unsigned at, unsigned encoding)
+{
+    ndb_query_key_t key;
+
+    key.query = tvb_get_uint32(tvb, at, encoding);
+    key.trans_lo = tvb_get_uint32(tvb, at + 4, encoding);
+    key.trans_hi = tvb_get_uint32(tvb, at + 8, encoding);
+    return (ndb_after_t *)wmem_map_lookup(ndb_queries, &key);
+}
+
+/* Keep what a request named after its bitmap, on the first pass. */
+static void
+ndb_after_keep(tvbuff_t *tvb, unsigned data_at, unsigned encoding,
+               const ndb_after_t *after)
+{
+    ndb_query_key_t key;
+    ndb_query_key_t *kept_key;
+    ndb_after_t *kept;
+
+    key.query = tvb_get_uint32(tvb, data_at + 4, encoding);
+    key.trans_lo = tvb_get_uint32(tvb, data_at + 24, encoding);
+    key.trans_hi = tvb_get_uint32(tvb, data_at + 28, encoding);
+    if (after->count == 0) {
+        wmem_map_remove(ndb_queries, &key);
+        return;
+    }
+    kept_key = wmem_new(wmem_file_scope(), ndb_query_key_t);
+    *kept_key = key;
+    kept = wmem_new(wmem_file_scope(), ndb_after_t);
+    *kept = *after;
+    wmem_map_insert(ndb_queries, kept_key, kept);
+}
+
+/*
+ * The words of packed values in a reply, the rest being the columns the
+ * request named after its bitmap, each a header and its value: taken
+ * off from the end, the last first, each where a header of its id ends
+ * exactly where the one after it begins. All the rest when they cannot
+ * be found.
+ */
+static unsigned
+ndb_packed_words(const ndb_words_t *w, const ndb_after_t *after)
+{
+    unsigned start = w->offset;
+    unsigned end = w->offset + 4 * w->left;
+    unsigned k = after->count;
+
+    while (k-- > 0) {
+        unsigned p = end;
+        bool found = false;
+
+        while (p > start) {
+            uint32_t header;
+
+            p -= 4;
+            header = tvb_get_uint32(w->tvb, p, w->encoding);
+            if ((header >> 16) == after->ids[k] &&
+                p + 4 + 4 * (((header & NDB_COL_SIZE) + 3) / 4) == end) {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return w->left;
+        end = p;
+    }
+    return (end - start) / 4;
+}
+
+/*
  * Column data: for each column a header, its id above and the value's
  * size in bytes below, then the value in whole words; a read names a
- * column with size 0. Two ids are not columns: "read every column"
+ * column with size 0. Some ids are not columns: "read every column"
  * carries the count of columns in its size and no value, and "columns
  * by bitmap" carries a bitmap of the columns wanted, or in a reply the
- * bitmap of those read, with the packed values after it.
+ * bitmap of those read, with the packed values after it; others name
+ * what the data node knows of a row, such as its lock reference.
+ *
+ * In a request, the ids named after "columns by bitmap" are put in
+ * after, when given; in a reply, after says which columns follow the
+ * packed values, when the request was seen.
  */
 static void
-ndb_columns(ndb_words_t *w, bool reply)
+ndb_columns(ndb_words_t *w, bool reply, ndb_after_t *after)
 {
+    bool masked = false;
+
     while (w->left > 0) {
         unsigned at = w->offset;
         uint32_t header = tvb_get_uint32(w->tvb, at, w->encoding);
         uint32_t id = header >> 16;
         uint32_t size = header & NDB_COL_SIZE;
         unsigned words = (size + 3) / 4;
+        const char *pseudo = ndb_pseudo_column_name(id);
         proto_tree *ct;
         proto_item *ci;
 
@@ -1413,6 +1602,10 @@ ndb_columns(ndb_words_t *w, bool reply)
                                 size);
         else if (id == NDB_COL_PARTITION)
             proto_item_set_text(ci, "Partition");
+        else if (pseudo != NULL && size == 0)
+            proto_item_set_text(ci, "The %s, asked for", pseudo);
+        else if (pseudo != NULL)
+            proto_item_set_text(ci, "The %s, %u bytes", pseudo, size);
         else if (size == 0)
             proto_item_set_text(ci, "Column %u, no value", id);
         else
@@ -1422,7 +1615,28 @@ ndb_columns(ndb_words_t *w, bool reply)
                                ndb_column_header_fields, w->encoding);
         w->offset += 4;
         w->left--;
-        if (words > 0) {
+        if (!reply && after != NULL) {
+            if (id == NDB_COL_READ_MASKED) {
+                masked = true;
+                after->count = 0;
+            } else if (masked && after->count < NDB_MAX_AFTER) {
+                after->ids[after->count++] = (uint16_t)id;
+            }
+        }
+        if (id == NDB_COL_LOCK_REF && words == NDB_LOCK_REF_WORDS) {
+            proto_tree *lt = proto_tree_add_subtree(ct, w->tvb, w->offset,
+                    4 * words, ett_ndb_lock_ref, NULL, "Lock reference");
+
+            proto_tree_add_bitmask(lt, w->tvb, w->offset, hf_ndb_lock_place,
+                                   ett_ndb_lock_ref, ndb_lock_place_fields,
+                                   w->encoding);
+            proto_tree_add_item(lt, hf_ndb_lock_op_index, w->tvb,
+                                w->offset + 4, 4, w->encoding);
+            proto_tree_add_item(lt, hf_ndb_lock_op_number, w->tvb,
+                                w->offset + 8, 4, w->encoding);
+            w->offset += 4 * words;
+            w->left -= words;
+        } else if (words > 0) {
             proto_tree_add_item(ct, id == NDB_COL_READ_MASKED ?
                                     hf_ndb_column_bitmap :
                                     hf_ndb_column_value,
@@ -1431,11 +1645,17 @@ ndb_columns(ndb_words_t *w, bool reply)
             w->left -= words;
         }
         if (reply && id == NDB_COL_READ_MASKED && w->left > 0) {
-            proto_tree_add_item(ct, hf_ndb_packed_values, w->tvb, w->offset,
-                                4 * w->left, ENC_NA);
-            proto_item_set_len(ci, 4 * (1 + words + w->left));
-            w->offset += 4 * w->left;
-            w->left = 0;
+            unsigned packed = w->left;
+
+            if (after != NULL && after->count > 0)
+                packed = ndb_packed_words(w, after);
+            if (packed > 0) {
+                proto_tree_add_item(ct, hf_ndb_packed_values, w->tvb,
+                                    w->offset, 4 * packed, ENC_NA);
+                proto_item_set_len(ci, 4 * (1 + words + packed));
+                w->offset += 4 * packed;
+                w->left -= packed;
+            }
         }
     }
 }
@@ -1955,7 +2175,7 @@ ndb_column_parts(ndb_words_t *w)
         else if (i == NDB_PART_SUBROUTINES)
             ndb_rest(&part);
         else
-            ndb_columns(&part, false);
+            ndb_columns(&part, false, NULL);
         w->offset += 4 * used;
         w->left -= used;
     }
@@ -2023,6 +2243,7 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
     uint32_t flags;
     uint32_t count;
     proto_tree *op_tree;
+    ndb_after_t *after = NULL;
 
     switch (signal) {
     case NDB_SIG_HEARTBEAT_REQ:
@@ -2067,7 +2288,12 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
             if (flags & NDB_FLAG_TAKEOVER)
                 ndb_bits(w, hf_ndb_takeover_info, ett_ndb_takeover_info,
                          ndb_takeover_info_fields);
-            if (flags & NDB_FLAG_DIST_KEY)
+            if ((flags & NDB_FLAG_DIST_KEY) &&
+                ((flags >> NDB_OP_TYPE_SHIFT) & NDB_OP_TYPE_MASK) ==
+                    NDB_OP_UNLOCK)
+                ndb_bits(w, hf_ndb_lock_place, ett_ndb_lock_ref,
+                         ndb_lock_place_fields);
+            else if (flags & NDB_FLAG_DIST_KEY)
                 ndb_word(w, hf_ndb_op_dist_key);
         }
         break;
@@ -2102,6 +2328,8 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
         ndb_word(w, hf_ndb_error_data);
         break;
     case NDB_SIG_ROW_DATA_REP:
+        if (w->left >= 3)
+            after = ndb_after_lookup(w->tvb, w->offset, w->encoding);
         ndb_word(w, hf_ndb_row_for);
         ndb_trans_id(w);
         if (w->sections > 0) {
@@ -2113,7 +2341,7 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
                                                  w->offset, w->left * 4,
                                                  ENC_NA);
             row.tree = proto_item_add_subtree(ri, ett_ndb_row);
-            ndb_columns(&row, true);
+            ndb_columns(&row, true, after);
             w->offset = row.offset;
             w->left = 0;
         }
@@ -2846,19 +3074,37 @@ ndb_message(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree,
                     ndb_object_names(&sw);
                 }
             } else if (fragment == 0) {
-                if ((signal == NDB_SIG_KEY_OP_REQ ||
-                     signal == NDB_SIG_UNIQUE_OP_REQ) && number == 1) {
-                    uint32_t op_flags = data_words > 4 ?
-                        tvb_get_uint32(tvb, data_at + 16, encoding) : 0;
+                uint32_t op_flags = data_words > 4 ?
+                    tvb_get_uint32(tvb, data_at + 16, encoding) : 0;
 
+                if (signal == NDB_SIG_KEY_OP_REQ && number == 0 &&
+                    ((op_flags >> NDB_OP_TYPE_SHIFT) & NDB_OP_TYPE_MASK) ==
+                        NDB_OP_UNLOCK &&
+                    section_len[i] == NDB_LOCK_REF_WORDS - 1) {
+                    /* An unlock's key: the rest of the lock reference. */
+                    sw.tree = proto_item_add_subtree(ti, ett_ndb_lock_ref);
+                    ndb_word(&sw, hf_ndb_lock_op_index);
+                    ndb_word(&sw, hf_ndb_lock_op_number);
+                } else if ((signal == NDB_SIG_KEY_OP_REQ ||
+                            signal == NDB_SIG_UNIQUE_OP_REQ) && number == 1) {
                     sw.tree = proto_item_add_subtree(ti, ett_ndb_row);
-                    if (op_flags & NDB_FLAG_INTERPRETED)
+                    if (op_flags & NDB_FLAG_INTERPRETED) {
                         ndb_column_parts(&sw);
-                    else
-                        ndb_columns(&sw, false);
+                    } else {
+                        ndb_after_t after;
+
+                        after.count = 0;
+                        ndb_columns(&sw, false, &after);
+                        if (!PINFO_FD_VISITED(pinfo) && data_words >= 8)
+                            ndb_after_keep(tvb, data_at, encoding, &after);
+                    }
                 } else if (signal == NDB_SIG_ROW_DATA_REP && number == 0) {
+                    ndb_after_t *after = NULL;
+
+                    if (data_words >= 3)
+                        after = ndb_after_lookup(tvb, data_at, encoding);
                     sw.tree = proto_item_add_subtree(ti, ett_ndb_row);
-                    ndb_columns(&sw, true);
+                    ndb_columns(&sw, true, after);
                 } else if (signal == NDB_SIG_SCAN_REQ && number == 0) {
                     sw.tree = proto_item_add_subtree(ti, ett_ndb_receiver);
                     while (sw.left > 0)
@@ -3656,6 +3902,24 @@ proto_register_ndb(void)
         { &hf_ndb_packed_values,
           { "Packed values", "ndb.column.packed", FT_BYTES, BASE_NONE, NULL,
             0x0, "The values read, in column order, packed", HFILL } },
+        { &hf_ndb_lock_place,
+          { "Node and fragment", "ndb.lock.place", FT_UINT32, BASE_HEX, NULL,
+            0x0, "Where the locked row is: a lock reference's first word, "
+            "and an unlock's distribution key", HFILL } },
+        { &hf_ndb_lock_node,
+          { "Data node", "ndb.lock.node", FT_UINT32, BASE_DEC, NULL,
+            0xFFFF0000, NULL, HFILL } },
+        { &hf_ndb_lock_fragment,
+          { "Fragment", "ndb.lock.fragment", FT_UINT32, BASE_DEC, NULL,
+            0x0000FFFF, NULL, HFILL } },
+        { &hf_ndb_lock_op_index,
+          { "Coordinator's operation", "ndb.lock.op_index", FT_UINT32,
+            BASE_HEX, NULL, 0x0, "The coordinator's index for the locking "
+            "operation", HFILL } },
+        { &hf_ndb_lock_op_number,
+          { "Data node's operation", "ndb.lock.op_number", FT_UINT32,
+            BASE_HEX, NULL, 0x0, "The low 32 bits of the data node's own "
+            "number for the locking operation", HFILL } },
         { &hf_ndb_coll_kind,
           { "Lookup", "ndb.collation.kind", FT_UINT32, BASE_DEC,
             VALS(ndb_collation_kind_vals), 0x0, NULL, HFILL } },
@@ -4066,6 +4330,7 @@ proto_register_ndb(void)
         &ett_ndb_row,
         &ett_ndb_column,
         &ett_ndb_column_header,
+        &ett_ndb_lock_ref,
         &ett_ndb_list_flags,
         &ett_ndb_object,
         &ett_ndb_object_flags,
@@ -4108,6 +4373,9 @@ proto_register_ndb(void)
     expert_module_t *expert_ndb;
 
     proto_ndb = proto_register_protocol("NDB Protocol", "NDB", "ndb");
+    ndb_queries = wmem_map_new_autoreset(wmem_epan_scope(), wmem_file_scope(),
+                                         ndb_query_key_hash,
+                                         ndb_query_key_equal);
     proto_register_field_array(proto_ndb, hf, array_length(hf));
     proto_register_subtree_array(ett, array_length(ett));
     expert_ndb = expert_register_protocol(proto_ndb);
