@@ -286,6 +286,7 @@ static dissector_handle_t ndb_handle;
 #define NDB_SIG_COMMIT_CONF             17
 #define NDB_SIG_COMMIT_REF              18
 #define NDB_SIG_COMMIT_REQ              19
+#define NDB_SIG_PROGRESS_REP            20
 #define NDB_SIG_TABLE_DESC_REF          23
 #define NDB_SIG_TABLE_DESC_REQ          24
 #define NDB_SIG_NODE_LOST_REP           26
@@ -334,6 +335,7 @@ static const value_string ndb_signal_vals[] = {
     { NDB_SIG_COMMIT_CONF,            "COMMIT_CONF" },
     { NDB_SIG_COMMIT_REF,             "COMMIT_REF" },
     { NDB_SIG_COMMIT_REQ,             "COMMIT_REQ" },
+    { NDB_SIG_PROGRESS_REP,           "PROGRESS_REP" },
     { NDB_SIG_TABLE_DESC_REF,         "TABLE_DESC_REF" },
     { NDB_SIG_TABLE_DESC_REQ,         "TABLE_DESC_REQ" },
     { NDB_SIG_NODE_LOST_REP,          "NODE_LOST_REP" },
@@ -2420,6 +2422,14 @@ ndb_signal_data(ndb_words_t *w, uint32_t signal)
         break;
     case NDB_SIG_ROLLBACK_CONF:
     case NDB_SIG_TAKEOVER_REF:
+        ndb_word(w, hf_ndb_client_ptr);
+        ndb_trans_id(w);
+        break;
+    case NDB_SIG_PROGRESS_REP:
+        /* The coordinator says a transaction or scan still runs, which
+         * restarts the API's wait for its replies; nothing answers it.
+         * Our pointer, then the transaction id, which RonDB leaves out
+         * until it is mended (2026-11-13): then the pointer is alone. */
         ndb_word(w, hf_ndb_client_ptr);
         ndb_trans_id(w);
         break;
